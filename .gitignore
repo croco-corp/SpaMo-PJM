@@ -70,3 +70,5 @@ tmp/
 datasets
 
 __pycache__
+
+venv/
