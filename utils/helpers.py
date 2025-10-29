@@ -3,7 +3,7 @@ import importlib
 import random
 import os
 import glob
-
+import av
 
 def derangement(lst):
     assert len(lst) > 1, "List must have at least two elements."
@@ -119,7 +119,31 @@ def read_video(fname, start_time=None, end_time=None):
     except Exception as e:
         print(e)
         return []
+    
+import logging
+import io
+logger = logging.getLogger(__name__)
+from PIL import Image
+def pad_image(image: Image) -> Image:
+    w, h = image.size
+    if w == h:
+        return image
+    
+    size = max(w, h)
+    new_image = Image.new('RGB', (size, size), (0, 0, 0))
+    new_image.paste(image, ((size - w) // 2, (size - h) // 2))
+    return new_image
 
+def frames_from_mpegts(buffer: io.BytesIO):
+    try:
+        container = av.open(buffer, format='mpegts')
+        stream = container.streams.video[0]
+        frames = [pad_image(frame.to_image()) for frame in container.decode(stream)]
+        
+        return frames
+    except Exception as e:
+        print(e)
+        return []
 
 def sliding_window_for_list(data_list, window_size, overlap_size):
     """
