@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import re
-import math
 import torch.nn.functional as F
 
 
@@ -39,7 +38,7 @@ def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidde
     mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', mm_projector_type)
     if mlp_gelu_match:
         mlp_depth = int(mlp_gelu_match.group(1)) if mlp_gelu_match.group(1).isdigit() else mlp_depth
-        modules = [nn.Linear(mm_hidden_size, hidden_size)]
+        modules: list[nn.Module] = [nn.Linear(mm_hidden_size, hidden_size)]
         for _ in range(1, mlp_depth):
             modules.append(nn.GELU())
             modules.append(nn.Linear(hidden_size, hidden_size))
@@ -78,7 +77,7 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]  # (batch_size, num_heads, seq_len, feature_dim_per_head)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
+            with torch.backends.cuda.sdp_kernel():  # type: ignore
                 q = F.scaled_dot_product_attention(q, k, v)
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale

@@ -93,5 +93,5 @@ class AbstractSLT(pl.LightningModule, ABC):
             lr_scheduler = {'scheduler': LambdaLR(optimizer, lr_lambda=scheduler.schedule),
                             'interval': 'step',
                             'frequency': 1}
-            return [optimizer], [lr_scheduler]
+            return [optimizer], [lr_scheduler]  # type: ignore
         return optimizer

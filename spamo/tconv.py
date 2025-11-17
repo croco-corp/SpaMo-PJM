@@ -1,9 +1,6 @@
-import pdb
 import copy
 import torch
-import collections
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class TemporalConv(nn.Module):
