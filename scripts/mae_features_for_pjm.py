@@ -39,10 +39,12 @@ class VideoMAEFeatureReader(object):
         self.overlap_size = overlap_size
         self.nth_layer = nth_layer
 
+        logger.info(f"Loading VideoMAE model: {model_name}")
         self.image_processor = VideoMAEImageProcessor.from_pretrained(
             model_name, cache_dir=cache_dir
         )
         self.model = VideoMAEModel.from_pretrained(model_name).to(self.device).eval()  # type: ignore
+        logger.info(f"Model loaded successfully on {self.device}")
 
     @torch.no_grad()
     def get_feats(self, video):
@@ -100,9 +102,13 @@ def get_parser():
 
 def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
     batch_size = args.batch_size
+    logger.info(f"Loading dataset: {args.dataset_path}, split: {split}")
     dataset = datasets.load_dataset(
         args.dataset_path, split=split, cache_dir=args.cache_dir
     )
+    logger.info(f"Dataset loaded: {len(dataset)} videos")
+    
+    logger.info(f"Opening LMDB crop params: {args.crop_params_path}")
     lmdb_env = lmdb.open(args.crop_params_path, readonly=True, lock=False)
     converter = ImageConverter(lmdb_env, (224, 224))
 
@@ -117,6 +123,8 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
     num = len(dataset)
 
     def iterate():
+        skipped_count = 0
+        processed_count = 0
         try:
             REQUIRED_NUM_FRAMES_FOR_MAE = 16
             for rec in dataset:
@@ -124,6 +132,7 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
                 frames = get_video_frames(rec["mp4"])
                 if not frames:
                     logger.warning(f"No frames for {video_id}, skipping")
+                    skipped_count += 1
                     continue
 
                 processed_frames = converter.process_frames(frames, video_id)
@@ -146,6 +155,7 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
                     feats = reader.get_feats(video_batch).cpu().numpy()
                     video_feats.append(feats)
 
+                processed_count += 1
                 yield (
                     np.concatenate(video_feats, axis=0),
                     video_id,
@@ -153,14 +163,33 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
                 )  # For now None, maybe in the future start time
         finally:
             lmdb_env.close()
+            if skipped_count > 0:
+                logger.warning(f"Skipped {skipped_count} videos due to missing frames")
+            logger.info(f"Successfully processed {processed_count} videos")
 
     return iterate, num
 
 
 def save_hdf5(save_in_every: int = 500):
+    import time
+    start_time = time.time()
+    
     parser = get_parser()
     args = parser.parse_args()
     split = args.split 
+    
+    logger.info("=" * 60)
+    logger.info("MAE Feature Extraction Started")
+    logger.info("=" * 60)
+    logger.info("Configuration:")
+    logger.info(f"  Model: {args.model_name}")
+    logger.info(f"  Device: {args.device}")
+    logger.info(f"  Overlap size: {args.overlap_size}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Split: {split}")
+    logger.info(f"  Output directory: {args.save_dir}")
+    logger.info("=" * 60)
+    
     generator, num = get_iterator_for_pjm(args, split=split)
     iterator = generator()
 
@@ -169,6 +198,7 @@ def save_hdf5(save_in_every: int = 500):
         logger.error(f"Output file {output_file} already exists!")
         raise FileExistsError(f"Output file {output_file} already exists!")
     
+    logger.info(f"Will save to: {output_file}")
     logger.info(f"Processing {num} videos for split '{split}'")
 
     with h5py.File(name=output_file, mode="w") as f:
@@ -197,6 +227,15 @@ def save_hdf5(save_in_every: int = 500):
                 f.flush()
                 logger.info(f"Flushed at video {i + 1}/{num}")
         f.flush()
+        
+    elapsed_time = time.time() - start_time
+    logger.info("=" * 60)
+    logger.info("Feature Extraction Completed!")
+    logger.info(f"  Total videos processed: {num}")
+    logger.info(f"  Output file: {output_file}")
+    logger.info(f"  Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} min)")
+    logger.info(f"  Average time per video: {elapsed_time/num:.2f}s")
+    logger.info("=" * 60)
 
 
 def main():
