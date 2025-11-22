@@ -106,7 +106,9 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
     dataset = datasets.load_dataset(
         args.dataset_path, split=split, cache_dir=args.cache_dir
     )
-    logger.info(f"Dataset loaded: {len(dataset)} videos")
+    num = sum(1 for _ in dataset)
+
+    logger.info(f"Dataset loaded: {num} videos")
     
     logger.info(f"Opening LMDB crop params: {args.crop_params_path}")
     lmdb_env = lmdb.open(args.crop_params_path, readonly=True, lock=False)
@@ -120,7 +122,6 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
         cache_dir=args.cache_dir,
     )
 
-    num = len(dataset)
 
     def iterate():
         skipped_count = 0
