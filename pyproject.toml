@@ -9,6 +9,7 @@ dependencies = [
     "einops==0.8.1",
     "einops-exts==0.0.4",
     "expecttest==0.2.1",
+    "h5py>=3.15.1",
     "hypothesis==6.115.5",
     "identify==2.6.9",
     "lightning==1.9.5",
