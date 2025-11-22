@@ -47,8 +47,8 @@ class VideoMAEFeatureReader(object):
         logger.info(f"Model loaded successfully on {self.device}")
 
     @torch.no_grad()
-    def get_feats(self, video):
-        inputs = self.image_processor(images=video, return_tensors="pt").to(self.device)  # type: ignore
+    def get_feats(self, chunk_batch):
+        inputs = self.image_processor(images=chunk_batch, return_tensors="pt").to(self.device)  # type: ignore
 
         outputs = self.model(**inputs, output_hidden_states=True).hidden_states
 
@@ -150,15 +150,15 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
                     overlap_size=args.overlap_size,
                 )
 
-                video_feats = []
+                chunk_feats = []
                 for j in range(0, len(frame_chunks), batch_size):
-                    video_batch = frame_chunks[j : j + batch_size]
-                    feats = reader.get_feats(video_batch).cpu().numpy()
-                    video_feats.append(feats)
+                    chunk_batch = frame_chunks[j : j + batch_size]
+                    feats = reader.get_feats(chunk_batch).cpu().numpy()
+                    chunk_feats.append(feats)
 
                 processed_count += 1
                 yield (
-                    np.concatenate(video_feats, axis=0),
+                    np.concatenate(chunk_feats, axis=0),
                     video_id,
                     None,
                 )  # For now None, maybe in the future start time
@@ -220,10 +220,10 @@ def save_hdf5(save_in_every: int = 500):
                 dtype="float32",
             )
             assert len(feats.shape) == 2, f"Expected 2D features, got {feats.shape}"
-            ds.attrs["num_frames"] = feats.shape[0]
+            ds.attrs["num_chunks"] = feats.shape[0]
             ds.attrs["features_dim"] = feats.shape[1]
 
-            pbar.set_postfix({"video_id": video_id, "frames": feats.shape[0]})
+            pbar.set_postfix({"video_id": video_id, "chunks": feats.shape[0]})
             if (i + 1) % save_in_every == 0:
                 f.flush()
                 logger.info(f"Flushed at video {i + 1}/{num}")
