@@ -100,7 +100,7 @@ def get_parser():
     return parser
 
 
-def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
+def get_iterator_for_pjm(args, split: str = "train", skip_ids: set = None) -> tuple[Callable, int]:
     batch_size = args.batch_size
     logger.info(f"Loading dataset: {args.dataset_path}, split: {split}")
     dataset = datasets.load_dataset(
@@ -109,6 +109,9 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
     num = sum(1 for _ in dataset)
 
     logger.info(f"Dataset loaded: {num} videos")
+    
+    if skip_ids:
+        logger.info(f"Will skip {len(skip_ids)} already processed videos")
     
     logger.info(f"Opening LMDB crop params: {args.crop_params_path}")
     lmdb_env = lmdb.open(args.crop_params_path, readonly=True, lock=False)
@@ -130,6 +133,11 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
             REQUIRED_NUM_FRAMES_FOR_MAE = 16
             for rec in dataset:
                 video_id = rec["__key__"]
+                
+                if skip_ids and video_id in skip_ids:
+                    skipped_count += 1
+                    continue
+                
                 frames = get_video_frames(rec["mp4"])
                 if not frames:
                     logger.warning(f"No frames for {video_id}, skipping")
@@ -165,7 +173,7 @@ def get_iterator_for_pjm(args, split: str = "train") -> tuple[Callable, int]:
         finally:
             lmdb_env.close()
             if skipped_count > 0:
-                logger.warning(f"Skipped {skipped_count} videos due to missing frames")
+                logger.info(f"Skipped {skipped_count} videos total")
             logger.info(f"Successfully processed {processed_count} videos")
 
     return iterate, num
@@ -191,27 +199,37 @@ def save_hdf5(save_in_every: int = 500):
     logger.info(f"  Output directory: {args.save_dir}")
     logger.info("=" * 60)
     
-    generator, num = get_iterator_for_pjm(args, split=split)
-    iterator = generator()
-
     output_file = osp.join(args.save_dir, f"mae_feat_pjm_{split}.h5")
-    if osp.exists(output_file):
-        logger.error(f"Output file {output_file} already exists!")
-        raise FileExistsError(f"Output file {output_file} already exists!")
     
-    logger.info(f"Will save to: {output_file}")
-    logger.info(f"Processing {num} videos for split '{split}'")
+    processed_ids = set()
+    if osp.exists(output_file):
+        logger.info(f"Found existing file: {output_file}")
+        with h5py.File(output_file, 'r') as existing:
+            processed_ids = set(existing.keys())
+        logger.info(f"Resuming: {len(processed_ids)} videos already processed")
+    else:
+        logger.info(f"Will save to: {output_file}")
+    
+    generator, num = get_iterator_for_pjm(args, split=split, skip_ids=processed_ids)
+    iterator = generator()
+    
+    if processed_ids:
+        logger.info(f"Remaining: {num - len(processed_ids)} videos to process")
+    else:
+        logger.info(f"Processing {num} videos for split '{split}'")
 
-    with h5py.File(name=output_file, mode="w") as f:
-        f.attrs["model"] = args.model_name
-        f.attrs["overlap_size"] = args.overlap_size
-        f.attrs["nth_layer"] = args.nth_layer
-        f.attrs["dataset_name"] = "PJM"
-        f.attrs["split"] = split
-        f.attrs["num"] = num
+    with h5py.File(name=output_file, mode="a") as f:
+        if len(processed_ids) == 0:
+            f.attrs["model"] = args.model_name
+            f.attrs["overlap_size"] = args.overlap_size
+            f.attrs["nth_layer"] = args.nth_layer
+            f.attrs["dataset_name"] = "PJM"
+            f.attrs["split"] = split
+            f.attrs["num"] = num
 
-        pbar = tqdm.tqdm(iterator, total=num, desc="Processing PJM")
-        for i, mae_feat in enumerate(pbar):
+        pbar = tqdm.tqdm(iterator, total=num - len(processed_ids), desc="Processing PJM")
+        newly_processed = 0
+        for mae_feat in pbar:
             feats, video_id, _ = mae_feat
 
             ds = f.create_dataset(
@@ -223,19 +241,25 @@ def save_hdf5(save_in_every: int = 500):
             ds.attrs["num_chunks"] = feats.shape[0]
             ds.attrs["features_dim"] = feats.shape[1]
 
+            newly_processed += 1
             pbar.set_postfix({"video_id": video_id, "chunks": feats.shape[0]})
-            if (i + 1) % save_in_every == 0:
+            if newly_processed % save_in_every == 0:
                 f.flush()
-                logger.info(f"Flushed at video {i + 1}/{num}")
+                logger.info(f"Flushed at {len(processed_ids) + newly_processed}/{num} videos")
         f.flush()
         
+        logger.info(f"Newly processed {newly_processed} videos")
+        
     elapsed_time = time.time() - start_time
+    total_in_file = len(processed_ids) + newly_processed
     logger.info("=" * 60)
     logger.info("Feature Extraction Completed!")
-    logger.info(f"  Total videos processed: {num}")
+    logger.info(f"  Total videos in output file: {total_in_file}/{num}")
+    logger.info(f"  Newly processed in this run: {newly_processed}")
     logger.info(f"  Output file: {output_file}")
     logger.info(f"  Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f} min)")
-    logger.info(f"  Average time per video: {elapsed_time/num:.2f}s")
+    if newly_processed > 0:
+        logger.info(f"  Average time per video: {elapsed_time/newly_processed:.2f}s")
     logger.info("=" * 60)
 
 
