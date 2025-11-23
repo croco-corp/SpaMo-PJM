@@ -16,9 +16,12 @@ sys.path.append("./")
 
 from utils.pjm.preprocessing import ImageConverter, get_video_frames
 from utils.helpers import sliding_window_for_list
+from utils.log import get_error_logger
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+error_logger = get_error_logger('mae_features_extract_errors.log')
 
 _GLOBAL_SEED = 0
 np.random.seed(_GLOBAL_SEED)
@@ -106,7 +109,7 @@ def get_iterator_for_pjm(args, split: str = "train", skip_ids: set = None) -> tu
     dataset = datasets.load_dataset(
         args.dataset_path, split=split, cache_dir=args.cache_dir
     )
-    num = sum(1 for _ in dataset)
+    num = len(dataset)
 
     logger.info(f"Dataset loaded: {num} videos")
     
@@ -129,9 +132,11 @@ def get_iterator_for_pjm(args, split: str = "train", skip_ids: set = None) -> tu
     def iterate():
         skipped_count = 0
         processed_count = 0
-        try:
-            REQUIRED_NUM_FRAMES_FOR_MAE = 16
-            for rec in dataset:
+        error_count = 0
+        pbar = tqdm.tqdm(total=num, desc="Processing PJM")
+        REQUIRED_NUM_FRAMES_FOR_MAE = 16
+        for rec in dataset:
+            try:
                 video_id = rec["__key__"]
                 
                 if skip_ids and video_id in skip_ids:
@@ -140,9 +145,7 @@ def get_iterator_for_pjm(args, split: str = "train", skip_ids: set = None) -> tu
                 
                 frames = get_video_frames(rec["mp4"])
                 if not frames:
-                    logger.warning(f"No frames for {video_id}, skipping")
-                    skipped_count += 1
-                    continue
+                    raise Exception("No frames found")
 
                 processed_frames = converter.process_frames(frames, video_id)
 
@@ -170,11 +173,19 @@ def get_iterator_for_pjm(args, split: str = "train", skip_ids: set = None) -> tu
                     video_id,
                     None,
                 )  # For now None, maybe in the future start time
-        finally:
-            lmdb_env.close()
-            if skipped_count > 0:
-                logger.info(f"Skipped {skipped_count} videos total")
-            logger.info(f"Successfully processed {processed_count} videos")
+            except Exception:
+                error_count += 1
+                failed_video_id = rec['__key__']
+                error_logger.exception(f"extract features error for {failed_video_id}")
+            finally:
+                pbar.update(1)
+                pbar.set_postfix({'processed': processed_count, 'skipped': skipped_count, 'errors': error_count})
+        
+        lmdb_env.close()
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} videos total")
+        logger.info(f"Successfully processed {processed_count} videos")
+        logger.info(f'failed videos: {error_count}')
 
     return iterate, num
 
@@ -227,9 +238,8 @@ def save_hdf5(save_in_every: int = 500):
             f.attrs["split"] = split
             f.attrs["num"] = num
 
-        pbar = tqdm.tqdm(iterator, total=num - len(processed_ids), desc="Processing PJM")
         newly_processed = 0
-        for mae_feat in pbar:
+        for mae_feat in iterator:
             feats, video_id, _ = mae_feat
 
             ds = f.create_dataset(
@@ -242,7 +252,6 @@ def save_hdf5(save_in_every: int = 500):
             ds.attrs["features_dim"] = feats.shape[1]
 
             newly_processed += 1
-            pbar.set_postfix({"video_id": video_id, "chunks": feats.shape[0]})
             if newly_processed % save_in_every == 0:
                 f.flush()
                 logger.info(f"Flushed at {len(processed_ids) + newly_processed}/{num} videos")
@@ -265,7 +274,6 @@ def save_hdf5(save_in_every: int = 500):
 
 def main():
     save_hdf5(save_in_every=500)
-
 
 if __name__ == "__main__":
     main()
