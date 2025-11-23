@@ -3,7 +3,12 @@ import importlib
 import random
 import os
 import glob
+from PIL import Image
+import logging
+import io
 import av
+logger = logging.getLogger(__name__)
+
 
 def derangement(lst):
     assert len(lst) > 1, "List must have at least two elements."
@@ -137,6 +142,29 @@ def pad_image(image: Image) -> Image:
 def frames_from_mpegts(buffer: io.BytesIO):
     try:
         container = av.open(buffer, format='mpegts')
+        stream = container.streams.video[0]
+        frames = [pad_image(frame.to_image()) for frame in container.decode(stream)]
+        
+        return frames
+    except Exception as e:
+        print(e)
+        return []
+
+def pad_image(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    if w == h:
+        return image
+    
+    size = max(w, h)
+    from typing import Any
+    bg: Any = (0, 0, 0)
+    new_image = Image.new('RGB', (size, size), bg)
+    new_image.paste(image, ((size - w) // 2, (size - h) // 2))
+    return new_image
+
+def frames_from_mpegts(buffer: io.BytesIO, bytes_format: str = 'mpegts') -> list:
+    try:
+        container = av.open(buffer, format=bytes_format)
         stream = container.streams.video[0]
         frames = [pad_image(frame.to_image()) for frame in container.decode(stream)]
         

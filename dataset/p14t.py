@@ -1,13 +1,11 @@
 import torch
-import os
 import numpy as np
-from typing import Dict, List, Optional, Union, Any, Tuple
+from typing import Dict, List, Union, Any
 from pathlib import Path
 from spamo.constants import *
-import random
 
 
-class Phoenix14T(torch.utils.data.Dataset):
+class Phoenix14T(torch.utils.data.Dataset):   # pyright: ignore[reportAttributeAccessIssue]
     """
     Dataset class for the Phoenix14T sign language dataset.
     
