@@ -6,7 +6,8 @@ import glob
 
 
 def derangement(lst):
-    assert len(lst) > 1, "List must have at least two elements."
+    if len(lst) <= 1:
+        return lst
     
     while True:
         shuffled = lst[:]

@@ -22,8 +22,8 @@ model:
     cross_modal_align: true
     combined_loss: true
     alpha: 1.0
-    use_in_context: true
-    num_in_context: 3
+    use_in_context: false
+    num_in_context: 0
 
 lightning:
   callback:
@@ -33,54 +33,21 @@ lightning:
         logging_interval: step
   trainer:
     accumulate_grad_batches: 2
-    accelerator: gpu
-    devices: 1
+    accelerator: tpu
+    devices: 8
     max_epochs: 500
     gradient_clip_val: 1.0
     check_val_every_n_epoch: 2
     precision: bf16
 
 data:
-  target: dataset.datamodule.DataModuleFromConfig
+  target: dataset.pjm.PJMDatamodule
   params:
     batch_size: 8
     num_workers: 4
-  
-    train:
-      target: dataset.p14t.Phoenix14T
-      params:
-        anno_root: ./preprocess/Phoenix14T
-        vid_root: ./dataset/Phoenix14T
-        feat_root: /data2/sl_datasets/vit_feat_Phoenix14T
-        mae_feat_root: /data2/sl_datasets/mae_feat_Phoenix14T
-        mode: train
-        spatial: true
-        spatiotemporal: true
-        spatial_postfix: _s2wrapping
-        spatiotemporal_postfix: _overlap-8-pretrained
-        
-    validation:
-      target: dataset.p14t.Phoenix14T
-      params:
-        anno_root: ./preprocess/Phoenix14T
-        vid_root: ./dataset/Phoenix14T
-        feat_root: /data2/sl_datasets/vit_feat_Phoenix14T
-        mae_feat_root: /data2/sl_datasets/mae_feat_Phoenix14T
-        mode: test
-        spatial: true
-        spatiotemporal: true
-        spatial_postfix: _s2wrapping
-        spatiotemporal_postfix: _overlap-8-pretrained
-    
-    test:
-      target: dataset.p14t.Phoenix14T
-      params:
-        anno_root: ./preprocess/Phoenix14T
-        vid_root: ./dataset/Phoenix14T
-        feat_root: /data2/sl_datasets/vit_feat_Phoenix14T
-        mae_feat_root: /data2/sl_datasets/mae_feat_Phoenix14T
-        mode: test
-        spatial: true
-        spatiotemporal: true
-        spatial_postfix: _s2wrapping
-        spatiotemporal_postfix: _overlap-8-pretrained
+    visual_features_path: features/vit_feat_pjm.h5 
+    spatiotemporal_features_path: features/mae_feat_pjm.h5
+    texts_path: features/pjm_texts.h5
+    batch_size: 32 
+    num_workers: 4 
+    val_split: 0.2

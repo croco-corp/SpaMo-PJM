@@ -327,8 +327,8 @@ class FlanT5SLT(AbstractSLT):
         Returns:
             Processed inputs dictionary
         """
-        pixel_values, glor_values, masks, ids = [], [], [], []
-        texts, glosses = [], []
+        pixel_values, glor_values, ids = [], [], []
+        texts= []
         num_frames, glor_lengths, langs = [], [], []
         ex_lang_translations = []
         
@@ -343,16 +343,16 @@ class FlanT5SLT(AbstractSLT):
                 # Collect metadata
                 ids.append(sample['id'])
                 texts.append(sample['text'].lower())
-                glosses.append(sample['gloss'])
                 langs.append(sample['lang'])
                 
-                _ex_lang_trans = [
-                    f"{sample['en_text']}={sample['text']}",
-                    f"{sample['fr_text']}={sample['text']}",
-                    f"{sample['es_text']}={sample['text']}"
-                ]
-                _ex_lang_trans = _ex_lang_trans[:self.num_in_context]
-                ex_lang_translations.append(' '.join(_ex_lang_trans))
+                if self.use_in_context:
+                    _ex_lang_trans = [
+                        f"{sample['en_text']}={sample['text']}",
+                        f"{sample['fr_text']}={sample['text']}",
+                        f"{sample['es_text']}={sample['text']}"
+                    ]
+                    _ex_lang_trans = _ex_lang_trans[:self.num_in_context]
+                    ex_lang_translations.append(' '.join(_ex_lang_trans))
                 
                 # Handle too long sequences with random cropping
                 if nframe > max_frame_len:
@@ -379,11 +379,9 @@ class FlanT5SLT(AbstractSLT):
         return {
             'pixel_values': pixel_values,
             'glor_values': glor_values,
-            'bool_mask_pos': masks,
             'ids': ids,
             'text': texts,
             'ex_lang_trans': ex_lang_translations,
-            'gloss': glosses,
             'lang': langs,
             'num_frames': num_frames,
             'glor_lengths': glor_lengths,
