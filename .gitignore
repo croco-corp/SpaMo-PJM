@@ -75,3 +75,5 @@ venv/
 
 #just experiments
 testing/ 
+
+features/*.h5*

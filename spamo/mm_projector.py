@@ -31,17 +31,17 @@ class SimpleResBlock(nn.Module):
         x = self.pre_norm(x)
         return x + self.proj(x)
 
-def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidden_size=768, mlp_depth=1):
+def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidden_size=768, mlp_depth=1, device=None):
     if mm_projector_type == 'linear':
-        return nn.Linear(mm_hidden_size, hidden_size)
+        return nn.Linear(mm_hidden_size, hidden_size, device=device)
 
     mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', mm_projector_type)
     if mlp_gelu_match:
         mlp_depth = int(mlp_gelu_match.group(1)) if mlp_gelu_match.group(1).isdigit() else mlp_depth
-        modules: list[nn.Module] = [nn.Linear(mm_hidden_size, hidden_size)]
+        modules: list[nn.Module] = [nn.Linear(mm_hidden_size, hidden_size, device=device)]
         for _ in range(1, mlp_depth):
             modules.append(nn.GELU())
-            modules.append(nn.Linear(hidden_size, hidden_size))
+            modules.append(nn.Linear(hidden_size, hidden_size, device=device))
         return nn.Sequential(*modules)
 
     if mm_projector_type == 'identity':

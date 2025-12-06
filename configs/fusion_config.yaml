@@ -1,0 +1,49 @@
+model:
+  target: models.fusion.FusionModel
+
+  params:
+    vision_input_dim: 2048
+    motion_input_dim: 1024
+    hidden_dim: 768 
+    target_size: 2048
+    device: cuda
+
+
+lightning_module:
+  target: models.fusion.LightningFusion
+  
+  params:     
+    lr: 6.0e-4
+    t5_checkpoint: google/flan-t5-xl
+    cache_dir: /data3/models
+    max_txt_len: 64
+    monitor: val/bleu4
+    beam_size: 5
+
+lightning:
+  callback:
+    learning_rate_logger:
+      target: pytorch_lightning.callbacks.LearningRateMonitor
+      params:
+        logging_interval: step
+  trainer:
+    accumulate_grad_batches: 2
+    accelerator: gpu
+    devices: 1
+    max_epochs: 500
+    gradient_clip_val: 1.0
+    check_val_every_n_epoch: 2
+    precision: bf16
+
+data:
+  target: dataset.fusion.FusionDataModule
+  
+  params:
+    batch_size: 8
+    num_workers: 4
+    visual_features_path: features/vit_feat_pjm.h5
+    motion_features_path: features/mae_feat_pjm.h5
+    texts_path: features/texts.h5
+    device: cuda
+    max_frame_length: 512
+    validation_proportion: 0.1

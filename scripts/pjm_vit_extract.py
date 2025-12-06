@@ -112,24 +112,24 @@ def main():
     extractor = FeaturesExtractor(converter, reader, batch_size=batch_size)
 
     dataset = datasets.load_dataset(args.dataset_path, split='train', cache_dir=args.cache_dir)
-    
-    output_file: Path = args.save_dir / "vit_feat_pjm.h5"
+    num = len(dataset)
+    output_file: Path = args.save_path / "vit_feat_pjm.h5"
     processed_ids = set()
     if output_file.exists():
         with h5py.File(output_file, mode='r') as existing:
             processed_ids = set(existing.keys())
         dataset = dataset.filter(lambda record: record['__key__'] not in processed_ids)
     
-    num = len(dataset)
     num_of_already_processed_videos = len(processed_ids)
     with h5py.File(name=output_file, mode="a") as hdf5_file:
         if num_of_already_processed_videos == 0:
             hdf5_file.attrs["model"] = args.model_name
-            hdf5_file.attrs["overlap_size"] = args.overlap_size
             hdf5_file.attrs["nth_layer"] = args.nth_layer
             hdf5_file.attrs["dataset_name"] = "PJM"
             hdf5_file.attrs["split"] = 'train'
             hdf5_file.attrs["num"] = num
+            hdf5_file.attrs['s2_mode'] = args.s2_mode
+            hdf5_file.attrs['scales'] = str(args.scales)
         
         pbar = tqdm.tqdm(total=num, desc='Processing PJM')
         if num_of_already_processed_videos != 0:
