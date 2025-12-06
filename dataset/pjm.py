@@ -1,7 +1,6 @@
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import random_split, DataLoader
-import numpy as np
 import h5py
 
 class PJMKorpusPreloaded(torch.utils.data.Dataset):
@@ -17,7 +16,7 @@ class PJMKorpusPreloaded(torch.utils.data.Dataset):
         spatiotemporal_features = h5py.File(spatiotemporal_features_path, mode='r')
         texts = h5py.File(texts_path, mode='r')
         
-        self.idx_to_key = sorted(self.visual_features.keys())
+        self.idx_to_key = sorted(visual_features.keys())
         self.data = []
         for key in self.idx_to_key:
             vf = torch.tensor(visual_features[key][()])

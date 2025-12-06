@@ -72,3 +72,7 @@ datasets
 __pycache__
 
 venv/
+/testing 
+/features
+mock_data/
+cache/
