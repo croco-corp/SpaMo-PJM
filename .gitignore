@@ -73,5 +73,5 @@ __pycache__
 
 venv/
 
-#just experiments
-testing/ 
+/testing
+/features
