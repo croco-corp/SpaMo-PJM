@@ -128,7 +128,7 @@ def test_fusion_model():
     # Trainer
     trainer = pl.Trainer(
         max_epochs=1,
-        fast_dev_run=True, # Run 1 batch of train/val/test
+        fast_dev_run=False, # Run 1 batch of train/val/test
         accelerator='cpu',
         devices=1,
         logger=False,
@@ -173,7 +173,7 @@ def test_t5_model():
     # Trainer
     trainer = pl.Trainer(
         max_epochs=1,
-        fast_dev_run=True,
+        fast_dev_run=False,
         accelerator='cpu',
         devices=1,
         logger=False,

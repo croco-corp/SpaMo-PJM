@@ -2,7 +2,7 @@ import os
 import torch
 import random
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Optional, Tuple, Any
 
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, T5ForConditionalGeneration
@@ -102,7 +102,7 @@ class T5SLT(AbstractSLT):
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
             t5_model, 
             cache_dir=self.cache_dir,
-            torch_dtype=torch.bfloat16, 
+            dtype=torch.bfloat16, 
         )
         
         self.t5_tokenizer = AutoTokenizer.from_pretrained(
@@ -115,7 +115,7 @@ class T5SLT(AbstractSLT):
         self, 
         visual_outputs: torch.Tensor, 
         visual_mask: torch.Tensor, 
-        samples: Dict, 
+        samples: dict, 
         split: str, 
         batch_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor]:
@@ -175,7 +175,7 @@ class T5SLT(AbstractSLT):
         
         return joint_outputs, joint_mask, output_tokens, targets
 
-    def prepare_visual_inputs(self, samples: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    def prepare_visual_inputs(self, samples: dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare visual inputs.
         
@@ -190,7 +190,7 @@ class T5SLT(AbstractSLT):
         
         return visual_outputs, visual_masks
 
-    def get_inputs(self, batch: List) -> Dict:
+    def get_inputs(self, batch: list) -> dict:
         """
         Process batch inputs into a structured dictionary.
         
@@ -254,7 +254,7 @@ class T5SLT(AbstractSLT):
             'glor_lengths': glor_lengths,
         }
 
-    def shared_step(self, inputs: Dict, split: str, batch_idx: int) -> Tuple[torch.Tensor, Dict]:
+    def shared_step(self, inputs: dict, split: str, batch_idx: int) -> Tuple[torch.Tensor, dict]:
         """
         Shared logic for training, validation and testing steps.
         
