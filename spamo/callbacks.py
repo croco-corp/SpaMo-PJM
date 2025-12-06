@@ -23,7 +23,7 @@ class LoggingCallback(Callback):
         """
         save_dir = os.path.join(save_dir, "text")
         os.makedirs(save_dir, exist_ok=True)
-        file_name = f"outputs.txt"
+        file_name = "outputs.txt"
         
         if prefix is not None:
             file_name = f"{prefix}-outputs.txt"
@@ -45,7 +45,7 @@ class LoggingCallback(Callback):
         references = pl_module.reference_text_list
 
         self.log_generated_text(
-            pl_module.logger.save_dir, ids, vis_strings, glosses, generated, references,
+            pl_module.logger.save_dir, ids, vis_strings, glosses, generated, references,  # type: ignore
         )
 
 
