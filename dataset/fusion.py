@@ -35,8 +35,8 @@ class FusionDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, index: int) -> tuple:
        (item_visual_features, item_motion_features, text) = self.data[index]
-       item_visual_features = torch.from_numpy(item_visual_features).to(self.device)
-       item_motion_features = torch.from_numpy(item_motion_features).to(self.device)
+       item_visual_features = torch.from_numpy(item_visual_features)
+       item_motion_features = torch.from_numpy(item_motion_features)
        num_of_frames = item_visual_features.size(dim=0)
        if num_of_frames > self.max_num_of_frames:
             start_index = random.randint(0, num_of_frames - self.max_num_of_frames)
@@ -69,6 +69,7 @@ class FusionDataModule(pl.LightningDataModule):
         validation_proportion = 0.1,
         num_workers = 4
     ):
+        super().__init__()
         self.visual_features_path = visual_features_path
         self.motion_features_path = motion_features_path
         self.texts_path = texts_path
@@ -86,11 +87,11 @@ class FusionDataModule(pl.LightningDataModule):
             device=self.device, 
             max_frame_length=self.max_frame_length
         )
-        train_length = len(dataset) * (1.0 - self.validation_proportion)
+        train_length = int(len(dataset) * (1.0 - self.validation_proportion))
         val_length = len(dataset) - train_length
         self.train_set, self.val_set = torch.utils.data.random_split(dataset, (train_length, val_length))
         
-    def _train_dataloader(self):
+    def train_dataloader(self):
         return torch.utils.data.DataLoader(
             dataset=self.train_set, 
             batch_size=self.batch_size,
@@ -99,7 +100,7 @@ class FusionDataModule(pl.LightningDataModule):
             collate_fn=collate_data
         )
 
-    def _val_dataloader(self):
+    def val_dataloader(self):
         return torch.utils.data.DataLoader(
             dataset=self.val_set, 
             batch_size=self.batch_size,

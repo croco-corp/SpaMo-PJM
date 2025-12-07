@@ -1,24 +1,25 @@
 model:
-  target: models.fusion.FusionModel
-
+  target: models.fusion.LightningFusion
+  
   params:
     vision_input_dim: 2048
     motion_input_dim: 1024
     hidden_dim: 768 
     target_size: 2048
-    device: cuda
-
-
-lightning_module:
-  target: models.fusion.LightningFusion
-  
-  params:     
+    device: cuda     
     lr: 6.0e-4
+    scheduler_config:
+      target: spamo.lr_scheduler.LambdaWarmUpCosineScheduler
+      params:
+        warm_up_steps: 1000
+        lr_min: 0.01
+        lr_max: 1.0
+        lr_start: 0.01
+        max_decay_steps: 125000
     t5_checkpoint: google/flan-t5-xl
-    cache_dir: /data3/models
     max_txt_len: 64
-    monitor: val/bleu4
-    beam_size: 5
+    # monitor: val/loss
+    # beam_size: 5
 
 lightning:
   callback:
@@ -30,10 +31,9 @@ lightning:
     accumulate_grad_batches: 2
     accelerator: gpu
     devices: 1
-    max_epochs: 500
+    max_epochs: 50
     gradient_clip_val: 1.0
     check_val_every_n_epoch: 2
-    precision: bf16
 
 data:
   target: dataset.fusion.FusionDataModule

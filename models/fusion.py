@@ -18,9 +18,8 @@ class FusionModel(nn.Module):
             hidden_dim: int = 768, 
             target_size: int = 2048,
             device: str | None = None,
-            **kwargs
     ):
-        super().__init__(**kwargs)
+        super().__init__()
         self.vision_projector = build_vision_projector('linear', vision_input_dim, hidden_dim, device=device)
         self.motion_projector = build_vision_projector('linear', motion_input_dim, hidden_dim, device=device)
         self.fusion_projector = build_vision_projector('mlp2x_gelu', hidden_dim, target_size, device=device)
@@ -63,23 +62,30 @@ class FusionModel(nn.Module):
 
 class LightningFusion(pl.LightningModule):
     def __init__(
-            self, 
-        fusion_model: FusionModel,
+        self,
+        vision_input_dim: int = 2048,
+        motion_input_dim: int = 1024,
+        hidden_dim: int = 768, 
+        target_size: int = 2048,
+        device: str | None = None,
         t5_checkpoint: str = 'google/flan-t5-xl',
         lr: float = 0.0001,
         scheduler_config: dict | None = None,
         target_embedding_weights_path: str = 'weights/flan-t5-xl-embeddings.pt',
         max_txt_len: int = 64,
-        cache_dir: str = "/data3/models",
-        **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__()
         self.t5_tokenizer = AutoTokenizer.from_pretrained(
             t5_checkpoint,
-            cache_dir=cache_dir,
             max_length=max_txt_len,
         )
-        self.fusion_model = fusion_model
+        self.fusion_model = FusionModel(
+            vision_input_dim,
+            motion_input_dim,
+            hidden_dim,
+            target_size,
+            device,
+        )
 
         weights = torch.load(target_embedding_weights_path)
         self.target_embedding = nn.Embedding.from_pretrained(weights, freeze=True)
@@ -115,19 +121,19 @@ class LightningFusion(pl.LightningModule):
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         """Perform a training step."""
         loss = self.shared_step(batch)
-        self.log_dict({'"train_loss': loss}, batch_size=len(batch['texts']), sync_dist=True)
+        self.log_dict({'train_loss': loss}, batch_size=len(batch['texts']), sync_dist=True, on_step=True, on_epoch=True, prog_bar=True)
         
         return loss
     
     def validation_step(self, batch, batch_idx: int) -> None:
         """Perform a validation step."""
         loss = self.shared_step(batch)
-        self.log_dict({'"val_loss': loss}, batch_size=len(batch['texts']), sync_dist=True)
+        self.log_dict({'val_loss': loss}, batch_size=len(batch['texts']), sync_dist=True, on_step=False, on_epoch=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx: int) -> None:
         """Perform a testing step."""
         loss = self.shared_step(batch)
-        self.log_dict({'"test_loss': loss}, batch_size=len(batch['texts']), sync_dist=True)
+        self.log_dict({'test_loss': loss}, batch_size=len(batch['texts']), sync_dist=True)
 
 
     def configure_optimizers(self):

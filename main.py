@@ -184,7 +184,7 @@ def configure_callbacks(
         callbacks.append(
             ModelCheckpoint(
                 dirpath=ckptdir,
-                filename="epoch={epoch:05}-step={step:07}-bleu4={val/bleu4:.2f}",
+                filename="epoch={epoch:05}-step={step:07}-loss={val/loss:.2f}",
                 monitor=model.monitor, # pyright: ignore[reportArgumentType]
                 auto_insert_metric_name=False,
                 save_top_k=1,
