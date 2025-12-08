@@ -68,14 +68,14 @@ class AbstractSLT(pl.LightningModule, ABC):
         """Perform a training step."""
         inputs = self.get_inputs(batch)
         loss, log_dict = self.shared_step(inputs, "train", batch_idx)
-        self.log_dict(log_dict, batch_size=len(inputs['text']), sync_dist=True)
+        self.log_dict(log_dict, batch_size=len(inputs['text']), sync_dist=True, on_step=True, on_epoch=True)
         return loss
     
     def validation_step(self, batch: List, batch_idx: int) -> None:
         """Perform a validation step."""
         inputs = self.get_inputs(batch)
         _, log_dict = self.shared_step(inputs, "val", batch_idx)
-        self.log_dict(log_dict, batch_size=len(inputs['text']), sync_dist=True)
+        self.log_dict(log_dict, batch_size=len(inputs['text']), sync_dist=True, on_step=False, on_epoch=True)
 
     def test_step(self, batch: List, batch_idx: int) -> None:
         """Perform a testing step."""
