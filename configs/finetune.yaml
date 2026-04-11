@@ -34,7 +34,7 @@ lightning:
     accumulate_grad_batches: 2
     accelerator: gpu
     devices: 1
-    max_epochs: 10
+    max_epochs: 60
     gradient_clip_val: 1.0
     check_val_every_n_epoch: 2
     precision: bf16
@@ -50,3 +50,4 @@ data:
     device: cuda
     max_frame_length: 512
     validation_proportion: 0.1
+    set_to_test: train

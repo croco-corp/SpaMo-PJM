@@ -74,4 +74,23 @@ __pycache__
 venv/
 
 #just experiments
-testing/ 
+testing/
+
+# Python
+.venv/
+*.pyc
+*.pyo
+
+# ML artifacts (large binary files)
+checkpoints/
+weights/
+features/
+images/
+
+# Runtime outputs
+nohup.out
+nohup.out.*
+*.log
+
+# uv
+.python-version test.py

@@ -67,7 +67,8 @@ class PJMDataModule(pl.LightningDataModule):
         max_frame_length: int = 512,
         batch_size = 64,
         validation_proportion = 0.1,
-        num_workers = 4
+        num_workers = 4,
+        set_to_test = 'val',
     ):
         super().__init__()
         self.visual_features_path = visual_features_path
@@ -78,6 +79,7 @@ class PJMDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.validation_proportion = validation_proportion
         self.num_workers = num_workers
+        self.set_to_test = set_to_test
         
     def setup(self, stage=None):
         dataset = PJMKorpus(
@@ -103,6 +105,19 @@ class PJMDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
             dataset=self.val_set, 
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            collate_fn=collate_data
+        )
+    def test_dataloader(self):
+        if self.set_to_test == 'train':
+                dataset = self.train_set
+        else:
+                dataset = self.val_set
+
+        return torch.utils.data.DataLoader(
+            dataset=dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=False,

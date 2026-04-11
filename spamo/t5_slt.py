@@ -633,10 +633,10 @@ class FlanT5SLT(AbstractSLT):
         print("\n===== Validation Examples =====")
         for i in range(min(5, len(self.generated))):
             print(
-                f"\033[94mReference: {self.references[i]}\033[0m"
+                f"Reference: {self.references[i]}"
             )  # Blue color for references
             print(
-                f"\033[92mGenerated: {self.generated[i]}\033[0m"
+                f"Generated: {self.generated[i]}"
             )  # Green color for generated
             print("-" * 50)
 
