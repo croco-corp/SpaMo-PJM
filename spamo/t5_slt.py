@@ -582,13 +582,11 @@ class FlanT5SLT(AbstractSLT):
                 generated, skip_special_tokens=True
             )
             generated_strings = [gen.lower() for gen in generated_strings]
->>>>>>> extract-pjm-features
 
             reference_strings = self.t5_tokenizer.batch_decode(
                 output_tokens.input_ids, skip_special_tokens=True
             )
             reference_strings = [ref.lower() for ref in reference_strings]
->>>>>>> extract-pjm-features
 
             self.generated.extend(generated_strings)
             self.references.extend(reference_strings)
