@@ -93,5 +93,6 @@ nohup.out.*
 *.log
 
 # uv
-.python-version test.py
+.python-version
+test.py
 features/*.h5*
