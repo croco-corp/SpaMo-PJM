@@ -573,6 +573,10 @@ class FlanT5SLT(AbstractSLT):
         )
         self.log_dict(eval_res, sync_dist=True)
 
+        # Degenerate output ratio (empty or ≤2 words)
+        degenerate = sum(1 for g in self.generated if len(g.split()) <= 2)
+        self.log("val/degenerate_ratio", degenerate / max(len(self.generated), 1), sync_dist=True)
+
         # Log W&B translation table and length distribution
         if self.logger and hasattr(self.logger, 'experiment'):
             import wandb

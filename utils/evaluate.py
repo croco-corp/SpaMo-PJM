@@ -38,6 +38,9 @@ def evaluate_results(predictions, references, split="train", device='cpu', token
             log_dicts[f"{split}/rougeL_precision"] = sum(s.precision for s in rouge_scores) / len(rouge_scores)
             log_dicts[f"{split}/rougeL_recall"] = sum(s.recall for s in rouge_scores) / len(rouge_scores)
 
+        # ChrF on val and test
+        log_dicts[f"{split}/chrf"] = CHRF().corpus_score(predictions, [references]).score
+
         # BERTScore F1 on val and test
         _, _, F1 = bert_score_fn(predictions, references, lang='en', device=device, verbose=False)
         log_dicts[f"{split}/bertscore_f1"] = F1.mean().item()
