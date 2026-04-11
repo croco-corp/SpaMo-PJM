@@ -560,23 +560,35 @@ class FlanT5SLT(AbstractSLT):
         # Print some examples of generated translations and references with colors
         print("\n===== Validation Examples =====")
         for i in range(min(5, len(self.generated))):
-            print(f"\033[94mReference: {self.references[i]}\033[0m")  # Blue color for references
-            print(f"\033[92mGenerated: {self.generated[i]}\033[0m")    # Green color for generated
+            print(f"\033[94mReference: {self.references[i]}\033[0m")
+            print(f"\033[92mGenerated: {self.generated[i]}\033[0m")
             print("-" * 50)
-            
+
         # Calculate evaluation metrics
         eval_res = evaluate_results(
             predictions=self.generated,
             references=self.references,
             split='val',
-            # tokenizer='zh' if outputs['lang'][0] == 'Chinese' else '13a',
             device=self.device
         )
-        
-        # Add evaluation results to logging
-        # log_dict.update(eval_res)
-
         self.log_dict(eval_res, sync_dist=True)
+
+        # Log W&B translation table and length distribution
+        if self.logger and hasattr(self.logger, 'experiment'):
+            import wandb
+            n = min(50, len(self.generated))
+            table = wandb.Table(
+                columns=["reference", "generated"],
+                data=[[self.references[i], self.generated[i]] for i in range(n)]
+            )
+            gen_lengths = [len(g.split()) for g in self.generated]
+            ref_lengths = [len(r.split()) for r in self.references]
+            self.logger.experiment.log({
+                "val/translation_examples": table,
+                "val/gen_length_hist": wandb.Histogram(gen_lengths),
+                "val/ref_length_hist": wandb.Histogram(ref_lengths),
+                "trainer/global_step": self.global_step,
+            })
 
         self.set_container()
 

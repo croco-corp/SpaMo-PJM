@@ -1,16 +1,18 @@
 from rouge_score import rouge_scorer
 from sacrebleu.metrics import BLEU, CHRF, TER
+from bert_score import score as bert_score_fn
 
 
 def evaluate_results(predictions, references, split="train", device='cpu', tokenizer='13a'):
     """
-    Evaluate prediction results using BLEU and ROUGE metrics.
+    Evaluate prediction results using BLEU, ROUGE and BERTScore metrics.
 
     Args:
         predictions (list): List of predicted sequences.
         references (list): List of reference sequences.
         tokenizer (object, optional): Tokenizer if needed for evaluation.
         split (str): The data split being evaluated.
+        device (str): Device for BERTScore computation.
 
     Returns:
         dict: A dictionary of evaluation scores.
@@ -25,17 +27,19 @@ def evaluate_results(predictions, references, split="train", device='cpu', token
             score = BLEU(max_ngram_order=i, tokenize=tokenizer).corpus_score(predictions, [references]).score
             log_dicts[f"{split}/bleu" + str(i)] = score
 
-        # Calculate ROUGE-L score
+    if split != 'train':
+        # ROUGE-L on val and test
         scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
         rouge_scores = [scorer.score(ref, pred)['rougeL'] for ref, pred in zip(references, predictions)]
-        
-        # Aggregate ROUGE-L scores (average precision, recall, and F1)
-        avg_precision = sum(score.precision for score in rouge_scores) / len(rouge_scores)
-        avg_recall = sum(score.recall for score in rouge_scores) / len(rouge_scores)
-        avg_f1 = sum(score.fmeasure for score in rouge_scores) / len(rouge_scores)
-
-        log_dicts[f"{split}/rougeL_precision"] = avg_precision
-        log_dicts[f"{split}/rougeL_recall"] = avg_recall
+        avg_f1 = sum(s.fmeasure for s in rouge_scores) / len(rouge_scores)
         log_dicts[f"{split}/rougeL_f1"] = avg_f1
+
+        if split == 'test':
+            log_dicts[f"{split}/rougeL_precision"] = sum(s.precision for s in rouge_scores) / len(rouge_scores)
+            log_dicts[f"{split}/rougeL_recall"] = sum(s.recall for s in rouge_scores) / len(rouge_scores)
+
+        # BERTScore F1 on val and test
+        _, _, F1 = bert_score_fn(predictions, references, lang='en', device=device, verbose=False)
+        log_dicts[f"{split}/bertscore_f1"] = F1.mean().item()
 
     return log_dicts
