@@ -30,35 +30,36 @@ class PJMKorpus(torch.utils.data.Dataset):
             vf = visual_features[key][()]
             mf = motion_features[key][()]
             text = texts[key][()].decode()
-            self.data.append((vf, mf, text))
+            self.data.append((key, vf, mf, text))
 
         visual_features.close()
         motion_features.close()
         texts.close()
 
-    def __getitem__(self, index: int) -> tuple:
-        item_visual_features, item_motion_features, text = self.data[index]
+    def __getitem__(self, index: int) -> dict:
+        key, item_visual_features, item_motion_features, text = self.data[index]
         item_visual_features = torch.from_numpy(item_visual_features)
         item_motion_features = torch.from_numpy(item_motion_features)
         num_of_frames = item_visual_features.size(dim=0)
         if num_of_frames > self.max_num_of_frames:
             start_index = random.randint(0, num_of_frames - self.max_num_of_frames)
             item_visual_features = item_visual_features[start_index:start_index + self.max_num_of_frames]
-        return item_visual_features, item_visual_features.size(dim=0), item_motion_features, item_motion_features.size(dim=0), text
+        return {
+            'id': key,
+            'pixel_value': item_visual_features,
+            'num_frames': item_visual_features.size(dim=0),
+            'glor_value': item_motion_features,
+            'text': text,
+            'lang': '',
+        }
 
     def __len__(self) -> int:
         return len(self.data)
 
 
 def collate_data(batch):
-    vfs, vf_lengths, mfs, mf_lengths, texts = zip(*batch)
-    return {
-        "vision_features": vfs,
-        "vision_features_seq_lengths": vf_lengths,
-        "motion_features": mfs,
-        "motion_features_seq_lengths": mf_lengths,
-        "texts": texts
-    }
+    # Return the list of sample dicts as-is; get_inputs() handles batching internally
+    return batch
 
 
 class PJMDataModule(pl.LightningDataModule):
@@ -137,5 +138,7 @@ class PJMDataModule(pl.LightningDataModule):
 
 
 if __name__ == '__main__':
-    dataset = PJMKorpus('features/vit_feat_pjm.h5', 'features/mae_feat_pjm.h5', 'features/texts_eng.h5', device='cuda')
-    loader = torch.utils.data.DataLoader(dataset, batch_size=64, collate_fn=collate_data)
+    dataset = PJMKorpus('features/vit_feat_pjm.h5', 'features/mae_feat_pjm.h5', 'features/texts_eng.h5', device='cpu')
+    loader = torch.utils.data.DataLoader(dataset, batch_size=8, collate_fn=collate_data)
+    batch = next(iter(loader))
+    print(f"Batch size: {len(batch)}, keys: {list(batch[0].keys())}")
