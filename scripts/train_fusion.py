@@ -1,8 +1,10 @@
+import sys
+import os
+sys.path.append(os.getcwd())
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import datetime
 import glob
-import os
-import sys
 from typing import Any
 
 import pytorch_lightning as pl
@@ -13,6 +15,7 @@ from pytorch_lightning.trainer import Trainer
 
 from utils.helpers import instantiate_from_config
 from spamo.callbacks import SetupCallback
+import torch
 
 
 def str2bool(v: Any) -> bool:
@@ -153,7 +156,6 @@ def setup_logging_dirs(opt: argparse.Namespace) -> tuple:
 
 def configure_callbacks(
     opt: argparse.Namespace,
-    model: pl.LightningModule,
     ckptdir: str,
     lightning_config: OmegaConf,
     logdir: str,
@@ -175,40 +177,24 @@ def configure_callbacks(
         List of callbacks
     """
     callbacks = [
-        instantiate_from_config(lightning_config.callback[callback]) # pyright: ignore[reportAttributeAccessIssue]
-        for callback in lightning_config.callback.keys() # pyright: ignore[reportAttributeAccessIssue]
+        instantiate_from_config(lightning_config.callback[callback_name]) # pyright: ignore[reportAttributeAccessIssue]
+        for callback_name in lightning_config.callback.keys() # pyright: ignore[reportAttributeAccessIssue]
     ] 
 
     # Add checkpointing and early stopping based on metric type
-    if opt.evaluation == "bleu":
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=ckptdir,
-
-                filename="epoch={epoch:05}-step={step:07}-bleu4={val/bleu4:.2f}",
-                monitor=model.monitor, # pyright: ignore[reportArgumentType]
-                auto_insert_metric_name=False,
-                save_top_k=1,
-                mode="max",
-            )
+    callbacks.append(
+        ModelCheckpoint(
+            dirpath=ckptdir,
+            filename="epoch={epoch:05}-step={step:07}-loss={val/loss:.4f}",
+            monitor='val_loss',
+            auto_insert_metric_name=False,
+            save_top_k=1,
+            mode="min",
         )
-        callbacks.append(
-            EarlyStopping(monitor=model.monitor, verbose=True, patience=50, mode="max") # pyright: ignore[reportArgumentType]
-        )
-    else:
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=ckptdir,
-                filename="epoch={epoch:05}-step={step:07}-loss={val/contra_loss:.4f}",
-                monitor=model.monitor, # pyright: ignore[reportArgumentType]
-                auto_insert_metric_name=False,
-                save_top_k=1,
-                mode="min",
-            )
-        )
-        callbacks.append(
-            EarlyStopping(monitor=model.monitor, verbose=True, patience=50, mode="min") # pyright: ignore[reportArgumentType]
-        )
+    )
+    callbacks.append(
+        EarlyStopping(monitor='val_loss', verbose=True, patience=50, mode="min") # pyright: ignore[reportArgumentType]
+    )
 
     # Setup callback for logging configuration
     callbacks.append(
@@ -266,6 +252,7 @@ def configure_logger(logger_type: str, logdir: str, nowname: str) -> dict:
 
 
 def main():
+    torch.set_float32_matmul_precision('high')
     """Main entry point for training and testing."""
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     sys.path.append(os.getcwd())
@@ -285,8 +272,7 @@ def main():
     # Set up directories and checkpoint path
     logdir, ckpt, nowname = setup_logging_dirs(opt)
     ckptdir = os.path.join(logdir, "checkpoints")
-    cfgdir = os.path.join(logdir, "configs")
-
+ 
     # Set random seed for reproducibility
     seed_everything(opt.seed)
 
@@ -318,7 +304,7 @@ def main():
         trainer_opt.logger = instantiate_from_config(logger_cfg)
 
         trainer_opt.callbacks = configure_callbacks(
-            opt, model, ckptdir, lightning_config, logdir, now, config
+            opt, ckptdir, lightning_config, logdir, now, config
         )
 
     # Create trainer

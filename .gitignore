@@ -94,3 +94,4 @@ nohup.out.*
 
 # uv
 .python-version test.py
+features/*.h5*

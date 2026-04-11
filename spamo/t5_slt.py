@@ -158,12 +158,14 @@ class FlanT5SLT(AbstractSLT):
         # Load the textual model
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
             t5_model,
-            dtype=torch.bfloat16,
+            cache_dir=self.cache_dir,
+            torch_dtype=torch.bfloat16,
         )
 
         # Load the tokenizer
         self.t5_tokenizer = AutoTokenizer.from_pretrained(
             t5_model,
+            cache_dir=self.cache_dir,
             max_length=self.max_txt_len,
         )
 
@@ -207,6 +209,7 @@ class FlanT5SLT(AbstractSLT):
 
         # Prepare the prompt with language information
         prompts = [f"{self.prompt}"] * bs
+
 
         if self.use_in_context:
             prompts = [f"{p} {c}" for p, c in zip(prompts, samples["ex_lang_trans"])]
@@ -349,65 +352,67 @@ class FlanT5SLT(AbstractSLT):
         Returns:
             Processed inputs dictionary
         """
-        # pixel_values, glor_values, masks, ids = [], [], [], []
-        # texts, glosses = [], []
-        # num_frames, glor_lengths, langs = [], [], []
-        # ex_lang_translations = []
+        pixel_values, glor_values, masks, ids = [], [], [], []
+        texts, glosses = [], []
+        num_frames, glor_lengths, langs = [], [], []
+        ex_lang_translations = []
 
-        # max_frame_len = self.max_frame_len
+        max_frame_len = self.max_frame_len
 
-        # for sample in batch:
-        #     if sample["pixel_value"].shape[0] != 0:
-        #         # Calculate number of frames after sampling
-        #         nframe = math.ceil(sample["num_frames"] / self.frame_sample_rate)
-        #         pval = sample["pixel_value"][:: self.frame_sample_rate]
+        for sample in batch:
+            if sample["pixel_value"].shape[0] != 0:
+                # Calculate number of frames after sampling
+                nframe = math.ceil(sample["num_frames"] / self.frame_sample_rate)
+                pval = sample["pixel_value"][:: self.frame_sample_rate]
 
-        #         # Collect metadata
-        #         ids.append(sample["id"])
-        #         texts.append(sample["text"].lower())
-        #         glosses.append(sample["gloss"])
-        #         langs.append(sample["lang"])
+                # Collect metadata
+                ids.append(sample["id"])
+                texts.append(sample["text"].lower())
+                glosses.append(sample["gloss"])
+                langs.append(sample["lang"])
 
-        #         _ex_lang_trans = [
-        #             f"{sample['en_text']}={sample['text']}",
-        #             f"{sample['fr_text']}={sample['text']}",
-        #             f"{sample['es_text']}={sample['text']}",
-        #         ]
-        #         _ex_lang_trans = _ex_lang_trans[: self.num_in_context]
-        #         ex_lang_translations.append(" ".join(_ex_lang_trans))
+                _ex_lang_trans = [
+                    f"{sample['en_text']}={sample['text']}",
+                    f"{sample['fr_text']}={sample['text']}",
+                    f"{sample['es_text']}={sample['text']}",
+                ]
+                _ex_lang_trans = _ex_lang_trans[: self.num_in_context]
+                ex_lang_translations.append(" ".join(_ex_lang_trans))
 
-        #         # Handle too long sequences with random cropping
-        #         if nframe > max_frame_len:
-        #             nframe = max_frame_len
-        #             start_index = random.randint(0, pval.size(0) - max_frame_len)
-        #             pval = pval[start_index : start_index + max_frame_len]
+                # Handle too long sequences with random cropping
+                if nframe > max_frame_len:
+                    nframe = max_frame_len
+                    start_index = random.randint(0, pval.size(0) - max_frame_len)
+                    pval = pval[start_index : start_index + max_frame_len]
 
-        #         # Store processed visual features
-        #         num_frames.append(nframe)
-        #         pixel_values.append(pval)
+                # Store processed visual features
+                num_frames.append(nframe)
+                pixel_values.append(pval)
 
-        #         # Process glor values if available
-        #         if sample["glor_value"] is not None:
-        #             if isinstance(sample["glor_value"], list):
-        #                 glor_values.append(torch.cat(sample["glor_value"], dim=0))
-        #                 glor_lengths.append(sum(len(g) for g in sample["glor_value"]))
-        #             else:
-        #                 glor_values.append(sample["glor_value"])
-        #                 glor_lengths.append(len(sample["glor_value"]))
+                # Process glor values if available
+                if sample["glor_value"] is not None:
+                    if isinstance(sample["glor_value"], list):
+                        glor_values.append(torch.cat(sample["glor_value"], dim=0))
+                        glor_lengths.append(sum(len(g) for g in sample["glor_value"]))
+                    else:
+                        glor_values.append(sample["glor_value"])
+                        glor_lengths.append(len(sample["glor_value"]))
 
-        # ex_lang_translations = derangement(ex_lang_translations)
-        
+        ex_lang_translations = derangement(ex_lang_translations)
+
         # Return structured dictionary
         return {
-            "pixel_values": batch['vision_features'],
-            "glor_values": batch['motion_features'],
-            "text": batch['texts'],
-            "num_frames": batch['vision_features_seq_lengths'],
-            "glor_lengths": batch['motion_features_seq_lengths'],
-            "lang": None,
-            "gloss": None,
-            "ex_lang_trans": None,
-            "ids": None
+            "pixel_values": pixel_values,
+            "glor_values": glor_values,
+            "bool_mask_pos": masks,
+            "ids": ids,
+            "text": texts,
+            "ex_lang_trans": ex_lang_translations,
+            "gloss": glosses,
+            "lang": langs,
+            "num_frames": num_frames,
+            "glor_lengths": glor_lengths,
+
         }
 
     def visual_textual_align(
@@ -576,12 +581,14 @@ class FlanT5SLT(AbstractSLT):
             generated_strings = self.t5_tokenizer.batch_decode(
                 generated, skip_special_tokens=True
             )
-            generated_strings = [gen for gen in generated_strings]
+            generated_strings = [gen.lower() for gen in generated_strings]
+>>>>>>> extract-pjm-features
 
             reference_strings = self.t5_tokenizer.batch_decode(
                 output_tokens.input_ids, skip_special_tokens=True
             )
-            reference_strings = [ref for ref in reference_strings]
+            reference_strings = [ref.lower() for ref in reference_strings]
+>>>>>>> extract-pjm-features
 
             self.generated.extend(generated_strings)
             self.references.extend(reference_strings)
@@ -637,6 +644,7 @@ class FlanT5SLT(AbstractSLT):
             )  # Blue color for references
             print(
                 f"Generated: {self.generated[i]}"
+
             )  # Green color for generated
             print("-" * 50)
 
