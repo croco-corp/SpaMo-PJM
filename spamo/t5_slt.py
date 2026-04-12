@@ -57,6 +57,7 @@ class FlanT5SLT(AbstractSLT):
         fusion_dropout: float = 0.0,
         fusion_lr: Optional[float] = None,
         queue_size: int = 0,
+        keypoint_dim: int = 0,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -86,8 +87,19 @@ class FlanT5SLT(AbstractSLT):
         self.fusion_dropout = fusion_dropout
         self.fusion_lr = fusion_lr
         self.queue_size = queue_size
+        self.keypoint_dim = keypoint_dim
 
         self.prepare_models(model_name)
+
+        # Keypoint projector: MediaPipe [T, keypoint_dim] → [T, d_model]
+        if self.keypoint_dim > 0:
+            d_model = self.t5_model.config.d_model
+            self.kp_proj = nn.Sequential(
+                nn.Linear(keypoint_dim, inter_hidden),
+                nn.LayerNorm(inter_hidden),
+                nn.GELU(),
+                nn.Linear(inter_hidden, d_model),
+            )
 
         # Memory bank for contrastive learning (queue of past visual embeddings)
         if self.queue_size > 0:
@@ -350,6 +362,7 @@ class FlanT5SLT(AbstractSLT):
         pixel_values, glor_values, ids = [], [], []
         texts, speaker_ids = [], []
         num_frames, glor_lengths, langs = [], [], []
+        keypoint_values = []
         ex_lang_translations = []
         
         max_frame_len = self.max_frame_len
@@ -393,6 +406,11 @@ class FlanT5SLT(AbstractSLT):
                     else:
                         glor_values.append(sample['glor_value'])
                         glor_lengths.append(len(sample['glor_value']))
+
+                # Collect keypoints if available
+                kp = sample.get('keypoint_value')
+                if kp is not None:
+                    keypoint_values.append(kp[::self.frame_sample_rate])
         
         ex_lang_translations = derangement(ex_lang_translations)
         
@@ -407,6 +425,7 @@ class FlanT5SLT(AbstractSLT):
             'lang': langs,
             'num_frames': num_frames,
             'glor_lengths': glor_lengths,
+            'keypoint_values': keypoint_values,
         }
 
     def visual_textual_align(self, visual_outputs: torch.Tensor, visual_masks: torch.Tensor, samples: Dict) -> torch.Tensor:
@@ -438,8 +457,14 @@ class FlanT5SLT(AbstractSLT):
         text_embeds = (enc_out * mask).sum(1) / mask.sum(1).clamp(min=1)
 
         # Mean pooling for visual embeddings
-        image_embeds = visual_outputs.mean(1)  # global pooling
-        
+        image_embeds = visual_outputs.mean(1)  # [B, d_model]
+
+        # Fuse keypoint stream if available
+        if self.keypoint_dim > 0 and samples.get('keypoint_values'):
+            kp_padded = pad_sequence(samples['keypoint_values'], batch_first=True).to(self.device)  # [B, T, 258]
+            kp_emb = self.kp_proj(kp_padded).mean(1)  # [B, d_model]
+            image_embeds = image_embeds + kp_emb
+
         # Normalize features
         image_embeds = F.normalize(image_embeds, dim=-1)
         text_embeds = F.normalize(text_embeds, dim=-1)
@@ -899,6 +924,8 @@ class FlanT5SLT(AbstractSLT):
         if self.fusion_lr is not None:
             fusion_modules = [self.temporal_encoder, self.fusion_proj,
                               self.spatio_proj, self.spatiotemp_proj]
+            if self.keypoint_dim > 0:
+                fusion_modules.append(self.kp_proj)
             fusion_ids = {id(p) for m in fusion_modules for p in m.parameters()}
             param_groups = [
                 {'params': [p for p in self.parameters() if id(p) not in fusion_ids], 'lr': self.lr},
