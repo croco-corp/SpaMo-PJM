@@ -1,8 +1,9 @@
 model:
   target: spamo.t5_slt.FlanT5SLT
-  
-  params:     
+
+  params:
     lr: 6.0e-4
+    fusion_lr: 6.0e-5        # 10x lower — fusion layers trained from scratch, main overfitting source
     monitor: val/bleu4
     model_name: google/flan-t5-xl
     cache_dir: /home/croco/.cache/huggingface/hub

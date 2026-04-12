@@ -18,6 +18,7 @@ dependencies = [
     "lightning-cloud==0.5.70",
     "lightning-utilities==0.14.0",
     "lmdb>=1.7.5",
+    "mediapipe>=0.10.33",
     "msgpack>=1.1.2",
     "numpy>=2.2.6",
     "omegaconf>=2.3.0",

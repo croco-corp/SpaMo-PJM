@@ -31,7 +31,7 @@ class SimpleResBlock(nn.Module):
         x = self.pre_norm(x)
         return x + self.proj(x)
 
-def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidden_size=768, mlp_depth=1, device=None):
+def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidden_size=768, mlp_depth=1, device=None, dropout=0.0):
     if mm_projector_type == 'linear':
         return nn.Linear(mm_hidden_size, hidden_size, device=device)
 
@@ -41,6 +41,8 @@ def build_vision_projector(mm_projector_type='linear', mm_hidden_size=512, hidde
         modules: list[nn.Module] = [nn.Linear(mm_hidden_size, hidden_size, device=device)]
         for _ in range(1, mlp_depth):
             modules.append(nn.GELU())
+            if dropout > 0.0:
+                modules.append(nn.Dropout(p=dropout))
             modules.append(nn.Linear(hidden_size, hidden_size, device=device))
         return nn.Sequential(*modules)
 

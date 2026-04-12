@@ -1,9 +1,10 @@
 model:
   target: spamo.t5_slt.FlanT5SLT
-  
-  params:     
+
+  params:
     lr: 6.0e-4
-    monitor: val/bleu4
+    fusion_lr: 6.0e-5
+    monitor: val/alignment_gap
     model_name: google/flan-t5-xl
     cache_dir: /home/croco/.cache/huggingface/hub
     inter_hidden: 768
@@ -19,12 +20,13 @@ model:
     lora_dropout: 0.1
     fusion_dropout: 0.3
     fusion_mode: joint
-    warm_up_steps: 0
+    warm_up_steps: null
     cross_modal_align: true
-    combined_loss: true
+    combined_loss: false
     alpha: 1.0
     use_in_context: false
     num_in_context: 0
+    queue_size: 4096
 
 lightning:
   callback:
@@ -33,7 +35,7 @@ lightning:
       params:
         logging_interval: step
   trainer:
-    accumulate_grad_batches: 2
+    accumulate_grad_batches: 1
     accelerator: gpu
     devices: 1
     max_epochs: 60
@@ -47,11 +49,11 @@ data:
     batch_size: 8
     num_workers: 4
     visual_features_path: features/vit_feat_pjm.h5
-    motion_features_path: features/mae_feat_pjm.h5
+    motion_features_path: features/hand_vit_feat_pjm.h5   # hand-crop ViT instead of VideoMAE
     texts_path: features/texts_eng.h5
-    train_split_path: /home/croco/CrocoSign/data/split_train.csv
-    val_split_path: /home/croco/CrocoSign/data/split_val.csv
-    test_split_path: /home/croco/CrocoSign/data/split_test.csv
+    train_split_path: /home/croco/CrocoSign/data/split_train_filtered.csv
+    val_split_path: /home/croco/CrocoSign/data/split_val_filtered.csv
+    test_split_path: /home/croco/CrocoSign/data/split_test_filtered.csv
     device: cuda
     max_frame_length: 512
     set_to_test: test

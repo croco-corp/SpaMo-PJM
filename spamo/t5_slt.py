@@ -54,6 +54,9 @@ class FlanT5SLT(AbstractSLT):
         lora_r: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
+        fusion_dropout: float = 0.0,
+        fusion_lr: Optional[float] = None,
+        queue_size: int = 0,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -80,8 +83,17 @@ class FlanT5SLT(AbstractSLT):
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
-        
+        self.fusion_dropout = fusion_dropout
+        self.fusion_lr = fusion_lr
+        self.queue_size = queue_size
+
         self.prepare_models(model_name)
+
+        # Memory bank for contrastive learning (queue of past visual embeddings)
+        if self.queue_size > 0:
+            d = self.t5_model.config.d_model
+            self.register_buffer('_vis_queue', F.normalize(torch.randn(queue_size, d), dim=-1))
+            self._queue_ptr = 0
 
         # Apply the selected tuning strategy
         if tuning_type == 'freeze':
@@ -90,7 +102,8 @@ class FlanT5SLT(AbstractSLT):
             self._apply_lora()
 
         self.set_container()
-        
+        self._reset_train_speaker_losses()
+
     # def load_pretrained_weights(self, checkpoint_path: str) -> None:
     #     """Load weights from a pretrained checkpoint."""
     #     checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
@@ -137,6 +150,13 @@ class FlanT5SLT(AbstractSLT):
     def set_container(self) -> None:
         self.generated = []
         self.references = []
+        self.speaker_ids_val = []
+        self.visual_embeds_val = []
+        self.diag_batch: dict | None = None  # first val batch snapshot for XAI forward pass
+
+    def _reset_train_speaker_losses(self) -> None:
+        from collections import defaultdict
+        self.train_speaker_losses: dict = defaultdict(list)
 
     def prepare_models(self, t5_model: str) -> None:
         """
@@ -163,10 +183,10 @@ class FlanT5SLT(AbstractSLT):
         # Load the vision projectors
         self.spatio_proj = build_vision_projector('linear', self.input_size, self.inter_hidden)
         self.spatiotemp_proj = build_vision_projector('linear', 1024, self.inter_hidden)
-        self.fusion_proj = build_vision_projector('mlp2x_gelu', self.inter_hidden, self.t5_model.config.hidden_size)
-        
+        self.fusion_proj = build_vision_projector('mlp2x_gelu', self.inter_hidden, self.t5_model.config.hidden_size, dropout=self.fusion_dropout)
+
         # Load the temporal encoder
-        self.temporal_encoder = TemporalConv(self.inter_hidden, self.inter_hidden)
+        self.temporal_encoder = TemporalConv(self.inter_hidden, self.inter_hidden, dropout=self.fusion_dropout)
 
         # if self.cross_modal_align:
         self.logit_scale = nn.Parameter(torch.tensor(2.6592))
@@ -328,7 +348,7 @@ class FlanT5SLT(AbstractSLT):
             Processed inputs dictionary
         """
         pixel_values, glor_values, ids = [], [], []
-        texts= []
+        texts, speaker_ids = [], []
         num_frames, glor_lengths, langs = [], [], []
         ex_lang_translations = []
         
@@ -344,6 +364,7 @@ class FlanT5SLT(AbstractSLT):
                 ids.append(sample['id'])
                 texts.append(sample['text'].lower())
                 langs.append(sample['lang'])
+                speaker_ids.append(sample.get('speaker_id', 'unknown'))
                 
                 if self.use_in_context:
                     _ex_lang_trans = [
@@ -381,6 +402,7 @@ class FlanT5SLT(AbstractSLT):
             'glor_values': glor_values,
             'ids': ids,
             'text': texts,
+            'speaker_ids': speaker_ids,
             'ex_lang_trans': ex_lang_translations,
             'lang': langs,
             'num_frames': num_frames,
@@ -406,24 +428,44 @@ class FlanT5SLT(AbstractSLT):
             return_tensors="pt",
         ).to(self.device)
         
-        # Get text embeddings
-        text_embeds = self.t5_model.encoder.embed_tokens(output_tokens.input_ids)
-        
-        # Mean pooling for visual and text embeddings
+        # Get text embeddings via T5 encoder (frozen, no grad) with masked mean pooling
+        with torch.no_grad():
+            enc_out = self.t5_model.encoder(
+                input_ids=output_tokens.input_ids,
+                attention_mask=output_tokens.attention_mask,
+            ).last_hidden_state.float()
+        mask = output_tokens.attention_mask.unsqueeze(-1).float()
+        text_embeds = (enc_out * mask).sum(1) / mask.sum(1).clamp(min=1)
+
+        # Mean pooling for visual embeddings
         image_embeds = visual_outputs.mean(1)  # global pooling
-        text_embeds = text_embeds.mean(1)  # global pooling
         
         # Normalize features
         image_embeds = F.normalize(image_embeds, dim=-1)
         text_embeds = F.normalize(text_embeds, dim=-1)
 
-        # Calculate cosine similarities with temperature scaling
-        logit_scale = self.logit_scale.exp()
-        logits_per_text = torch.matmul(text_embeds, image_embeds.t()) * logit_scale
-        logits_per_image = logits_per_text.T
+        # Calculate cosine similarities with temperature scaling (clamped like CLIP, max=100)
+        logit_scale = self.logit_scale.clamp(max=4.6052).exp()
 
-        # Calculate contrastive loss
-        loss = clip_loss(logits_per_text)
+        if self.queue_size > 0:
+            # Asymmetric loss: text queries against current batch + memory bank
+            all_image = torch.cat([image_embeds, self._vis_queue.clone().detach()], dim=0)  # [B+Q, D]
+            logits = torch.matmul(text_embeds, all_image.t()) * logit_scale  # [B, B+Q]
+            labels = torch.arange(len(text_embeds), device=self.device)
+            loss = F.cross_entropy(logits, labels)
+            # Update circular queue with current batch
+            with torch.no_grad():
+                B = image_embeds.shape[0]
+                ptr = self._queue_ptr
+                slots = min(B, self.queue_size - ptr)
+                self._vis_queue[ptr:ptr + slots] = image_embeds.detach()[:slots]
+                if slots < B:
+                    self._vis_queue[:B - slots] = image_embeds.detach()[slots:]
+                self._queue_ptr = (ptr + B) % self.queue_size
+        else:
+            logits_per_text = torch.matmul(text_embeds, image_embeds.t()) * logit_scale
+            logits_per_image = logits_per_text.T
+            loss = clip_loss(logits_per_text)
         
         return loss
 
@@ -442,9 +484,14 @@ class FlanT5SLT(AbstractSLT):
         # Prepare visual inputs and project to match text embedding dimensions
         visual_outputs, visual_masks = self.prepare_visual_inputs(inputs)
         visual_outputs = self.fusion_proj(visual_outputs)
-        
+
         # Initialize logging dictionary
         log_dict = {}
+
+        # Diagnostic: diversity of visual features in this batch (signal richness proxy)
+        log_dict[f"{split}/visual_feat_std"] = visual_outputs.mean(1).std(0).mean().item()
+        # Diagnostic: contrastive temperature (should grow stably, not explode or collapse)
+        log_dict[f"{split}/logit_scale"] = self.logit_scale.exp().item()
         
         # STEP 1: Determine training mode and prepare inputs accordingly
         if self.cross_modal_align:
@@ -517,30 +564,39 @@ class FlanT5SLT(AbstractSLT):
 
         # STEP 2: Handle evaluation phase (validation/testing)
         if split != "train":
-            # Prepare inputs for text generation
-            input_embeds, input_masks, _, _ = self.prepare_inputs(
-                visual_outputs, visual_masks, inputs, split, batch_idx
-            )
-            
-            # Generate translations
-            generated = self.t5_model.generate(
-                inputs_embeds=input_embeds,
-                attention_mask=input_masks,
-                num_beams=5,
-                max_length=self.max_txt_len,
-                top_p=0.9,
-                do_sample=True,
-            )
-            
-            # Decode generated outputs and references
-            generated_strings = self.t5_tokenizer.batch_decode(generated, skip_special_tokens=True)
-            generated_strings = [gen.lower() for gen in generated_strings]
-            
             reference_strings = self.t5_tokenizer.batch_decode(output_tokens.input_ids, skip_special_tokens=True)
             reference_strings = [ref.lower() for ref in reference_strings]
-
-            self.generated.extend(generated_strings)
             self.references.extend(reference_strings)
+            self.speaker_ids_val.extend(inputs['speaker_ids'])
+            self.visual_embeds_val.append(visual_outputs.mean(1).detach().float())
+
+            if not (not self.combined_loss and self.warm_up_steps is None):
+                # Full pipeline: generate translations
+                input_embeds, input_masks, _, _ = self.prepare_inputs(
+                    visual_outputs, visual_masks, inputs, split, batch_idx
+                )
+                generated = self.t5_model.generate(
+                    inputs_embeds=input_embeds,
+                    attention_mask=input_masks,
+                    num_beams=5,
+                    max_length=self.max_txt_len,
+                    top_p=0.9,
+                    do_sample=True,
+                )
+                generated_strings = self.t5_tokenizer.batch_decode(generated, skip_special_tokens=True)
+                generated_strings = [gen.lower() for gen in generated_strings]
+                self.generated.extend(generated_strings)
+
+                if batch_idx == 0 and self.diag_batch is None:
+                    n_diag = min(8, input_embeds.shape[0])
+                    self.diag_batch = {
+                        'input_embeds': input_embeds[:n_diag].detach(),
+                        'input_masks': input_masks[:n_diag].detach(),
+                        'output_ids': output_tokens.input_ids[:n_diag].detach(),
+                        'output_mask': output_tokens.attention_mask[:n_diag].detach(),
+                        'ref_strings': reference_strings[:n_diag],
+                        'gen_strings': generated_strings[:n_diag],
+                    }
             
             # Calculate evaluation metrics
             # eval_res = evaluate_results(
@@ -556,7 +612,200 @@ class FlanT5SLT(AbstractSLT):
 
         return loss, log_dict
 
+    def training_step(self, batch, batch_idx):
+        inputs = self.get_inputs(batch)
+        loss, log_dict = self.shared_step(inputs, "train", batch_idx)
+        self.log_dict(log_dict, batch_size=len(inputs['text']), sync_dist=True, on_step=True, on_epoch=True)
+        loss_val = loss.item()
+        for sid in inputs['speaker_ids']:
+            self.train_speaker_losses[sid].append(loss_val)
+        return loss
+
+    def on_train_epoch_end(self) -> None:
+        if not self.train_speaker_losses:
+            return
+        import statistics
+        rows = []
+        for sid in sorted(self.train_speaker_losses.keys()):
+            vals = self.train_speaker_losses[sid]
+            rows.append([sid, len(vals), round(sum(vals) / len(vals), 4)])
+        loss_means = [r[2] for r in rows]
+        self.log("train/speaker_loss_std", statistics.stdev(loss_means) if len(loss_means) > 1 else 0.0, sync_dist=True)
+        if self.logger and hasattr(self.logger, 'experiment'):
+            import wandb
+            self.logger.experiment.log({
+                "train/per_speaker_loss": wandb.Table(
+                    columns=["speaker_id", "n_batches", "mean_loss"],
+                    data=rows,
+                ),
+                "trainer/global_step": self.global_step,
+            })
+        self._reset_train_speaker_losses()
+
+    def _aggregate_cross_attention(self, cross_attentions) -> 'torch.Tensor':
+        """
+        Combines: max over heads (keeps sharpest attention per position),
+        then mean over top-6 decoder layers (most semantic signal).
+        Returns float32 [dec_seq_len, enc_seq_len].
+        """
+        top_layers = cross_attentions[-6:]                          # (6,) × [1, heads, dec, enc]
+        stacked = torch.stack([l.squeeze(0) for l in top_layers])  # [6, heads, dec, enc]
+        sharpened = stacked.max(dim=1).values                       # [6, dec, enc] — max over heads
+        return sharpened.mean(dim=0).float()                        # [dec, enc]
+
+    def _log_xai_diagnostics(self, split: str, cos_sims: 'torch.Tensor | None') -> None:
+        if not self.logger or not hasattr(self.logger, 'experiment'):
+            return
+        import wandb, statistics
+        from sacrebleu.metrics import CHRF as SacreCHRF
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        # B: per-sample cosine_sim vs sentence-level ChrF scatter
+        if cos_sims is not None and len(self.references) == len(cos_sims):
+            chrf_scores = [
+                SacreCHRF().sentence_score(pred, [ref]).score
+                for pred, ref in zip(self.generated, self.references)
+            ]
+            scatter_table = wandb.Table(
+                columns=["cosine_sim", "chrf", "reference", "generated"],
+                data=[
+                    [float(cos_sims[i].item()), chrf_scores[i], self.references[i], self.generated[i]]
+                    for i in range(len(self.references))
+                ],
+            )
+            self.logger.experiment.log({f"{split}/cosine_vs_chrf": scatter_table, "trainer/global_step": self.global_step})
+
+        # A + D: attention heatmap + token-frame cosine sim — run only every 10 epochs
+        if self.diag_batch is None or self.current_epoch % 10 != 0:
+            return
+
+        db = self.diag_batch
+        with torch.no_grad():
+            diag_out = self.t5_model(
+                inputs_embeds=db['input_embeds'],
+                attention_mask=db['input_masks'],
+                decoder_input_ids=db['output_ids'],
+                decoder_attention_mask=db['output_mask'],
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        xai_images = {}
+        for i in range(db['input_embeds'].shape[0]):
+            # A: cross-attention heatmap
+            try:
+                sample_attn = tuple(layer[i:i+1] for layer in diag_out.cross_attentions)
+                heatmap = self._aggregate_cross_attention(sample_attn).cpu().numpy()
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.imshow(heatmap, aspect='auto', cmap='viridis')
+                ax.set_xlabel("Visual frame position")
+                ax.set_ylabel("Generated token")
+                ref_tokens = self.t5_tokenizer.convert_ids_to_tokens(db['output_ids'][i].tolist(), skip_special_tokens=True)
+                ax.set_yticks(range(len(ref_tokens)))
+                ax.set_yticklabels(ref_tokens, fontsize=7)
+                ax.set_title(f"Ref: {db['ref_strings'][i][:60]}")
+                fig.tight_layout()
+                xai_images[f"{split}/xai_attention_{i}"] = wandb.Image(fig)
+                plt.close(fig)
+            except NotImplementedError:
+                pass
+
+            # D: token-frame cosine similarity matrix
+            dec_h = diag_out.decoder_hidden_states[-1][i].float()   # [dec_seq, hidden]
+            enc_h = db['input_embeds'][i].float()                    # [enc_seq, hidden]
+            tf_sim = (F.normalize(dec_h, dim=-1) @ F.normalize(enc_h, dim=-1).T).cpu().numpy()
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.imshow(tf_sim, aspect='auto', cmap='RdBu', vmin=-1, vmax=1)
+            ax.set_xlabel("Visual frame position")
+            ax.set_ylabel("Decoder token position")
+            ax.set_title(f"Token-frame cosine sim | ref: {db['ref_strings'][i][:60]}")
+            fig.tight_layout()
+            xai_images[f"{split}/xai_token_frame_{i}"] = wandb.Image(fig)
+            plt.close(fig)
+
+        if xai_images:
+            xai_images["trainer/global_step"] = self.global_step
+            self.logger.experiment.log(xai_images)
+
+    def _compute_retrieval_metrics(self, split: str) -> None:
+        """Alignment gap + R@1/5/10 using T5 encoder as text tower."""
+        if not self.visual_embeds_val or not self.references:
+            return
+        vis_embeds = torch.cat(self.visual_embeds_val, dim=0).to(self.device)  # [N, hidden]
+        # Build text embeddings via T5 encoder (masked mean pool, chunked)
+        chunk_size = 128
+        txt_list = []
+        with torch.no_grad():
+            for i in range(0, len(self.references), chunk_size):
+                chunk = self.references[i:i + chunk_size]
+                tokens = self.t5_tokenizer(
+                    chunk, padding="longest", truncation=True,
+                    max_length=self.max_txt_len, return_tensors="pt"
+                ).to(self.device)
+                enc = self.t5_model.encoder(
+                    input_ids=tokens.input_ids,
+                    attention_mask=tokens.attention_mask,
+                ).last_hidden_state.float()
+                mask = tokens.attention_mask.unsqueeze(-1).float()
+                txt_list.append((enc * mask).sum(1) / mask.sum(1).clamp(min=1))
+        txt_embeds = torch.cat(txt_list, dim=0)  # [N, hidden]
+
+        vis_norm = F.normalize(vis_embeds.float(), dim=-1)
+        txt_norm = F.normalize(txt_embeds, dim=-1)
+        sim = vis_norm @ txt_norm.T  # [N, N]
+
+        N = sim.shape[0]
+        diag = sim.diagonal()
+        off_diag_sum = sim.sum() - diag.sum()
+        alignment_gap = diag.mean().item() - (off_diag_sum / (N * (N - 1))).item()
+        self.log(f"{split}/alignment_gap", alignment_gap, sync_dist=True)
+
+        ranks = (sim > diag.unsqueeze(1)).sum(dim=1)  # how many scores beat the correct one
+        for k in [1, 5, 10]:
+            recall_at_k = (ranks < k).float().mean().item()
+            self.log(f"{split}/R@{k}", recall_at_k, sync_dist=True)
+        self.log(f"{split}/median_rank", ranks.float().median().item() + 1, sync_dist=True)
+
+    def _log_per_speaker_metrics(self, split: str, speaker_ids: list, preds: list, refs: list) -> None:
+        from collections import defaultdict
+        import statistics
+        from sacrebleu.metrics import BLEU as SacreBLEU, CHRF as SacreCHRF
+        spk_preds: dict = defaultdict(list)
+        spk_refs: dict = defaultdict(list)
+        for sid, pred, ref in zip(speaker_ids, preds, refs):
+            spk_preds[sid].append(pred)
+            spk_refs[sid].append(ref)
+        rows, bleu4s = [], []
+        for sid in sorted(spk_preds.keys()):
+            b4 = SacreBLEU(max_ngram_order=4, tokenize='13a').corpus_score(spk_preds[sid], [spk_refs[sid]]).score
+            chrf = SacreCHRF().corpus_score(spk_preds[sid], [spk_refs[sid]]).score
+            rows.append([sid, len(spk_preds[sid]), round(b4, 3), round(chrf, 3)])
+            bleu4s.append(b4)
+        if len(bleu4s) > 1:
+            self.log(f"{split}/speaker_bleu4_std", statistics.stdev(bleu4s), sync_dist=True)
+        if self.logger and hasattr(self.logger, 'experiment'):
+            import wandb
+            self.logger.experiment.log({
+                f"{split}/per_speaker_metrics": wandb.Table(
+                    columns=["speaker_id", "n_samples", "bleu4", "chrf"],
+                    data=rows,
+                ),
+                "trainer/global_step": self.global_step,
+            })
+
     def on_validation_epoch_end(self) -> None:
+        is_contrastive_only = not self.combined_loss and self.warm_up_steps is None
+
+        if is_contrastive_only:
+            # Fast contrastive-only mode: skip beam search metrics, compute retrieval metrics only
+            self._compute_retrieval_metrics('val')
+            self.set_container()
+            return
+
         # Print some examples of generated translations and references with colors
         print("\n===== Validation Examples =====")
         for i in range(min(5, len(self.generated))):
@@ -577,7 +826,37 @@ class FlanT5SLT(AbstractSLT):
         degenerate = sum(1 for g in self.generated if len(g.split()) <= 2)
         self.log("val/degenerate_ratio", degenerate / max(len(self.generated), 1), sync_dist=True)
 
-        # Log W&B translation table and length distribution
+        cos_sims = None
+        # Cosine similarity: mean-pooled visual embeddings vs T5 encoder output
+        if self.visual_embeds_val:
+            vis_embeds = torch.cat(self.visual_embeds_val, dim=0)  # [N, hidden]
+            chunk_size = 128
+            text_embeds_list = []
+            with torch.no_grad():
+                for i in range(0, len(self.references), chunk_size):
+                    chunk = self.references[i:i + chunk_size]
+                    tokens = self.t5_tokenizer(
+                        chunk, padding="longest", truncation=True,
+                        max_length=self.max_txt_len, return_tensors="pt"
+                    ).to(self.device)
+                    enc_out = self.t5_model.encoder(
+                        input_ids=tokens.input_ids,
+                        attention_mask=tokens.attention_mask,
+                    ).last_hidden_state  # [B, seq, hidden]
+                    # Masked mean pooling — exclude PAD tokens
+                    mask = tokens.attention_mask.unsqueeze(-1).float()
+                    pooled = (enc_out.float() * mask).sum(1) / mask.sum(1).clamp(min=1)
+                    text_embeds_list.append(pooled)
+            text_embeds = torch.cat(text_embeds_list, dim=0)  # [N, hidden]
+            vis_norm = F.normalize(vis_embeds, dim=-1)
+            txt_norm = F.normalize(text_embeds, dim=-1)
+            cos_sims = (vis_norm * txt_norm).sum(-1)  # [N]
+            self.log("val/cosine_sim_mean", cos_sims.mean().item(), sync_dist=True)
+            self.log("val/cosine_sim_std", cos_sims.std().item(), sync_dist=True)
+
+        self._log_xai_diagnostics('val', cos_sims)
+        self._log_per_speaker_metrics('val', self.speaker_ids_val, self.generated, self.references)
+
         if self.logger and hasattr(self.logger, 'experiment'):
             import wandb
             n = min(50, len(self.generated))
@@ -613,14 +892,25 @@ class FlanT5SLT(AbstractSLT):
         )
 
         self.log_dict(eval_res, sync_dist=True)
+        self._log_per_speaker_metrics('test', self.speaker_ids_val, self.generated, self.references)
         self.set_container()
 
     def configure_optimizers(self):
+        if self.fusion_lr is not None:
+            fusion_modules = [self.temporal_encoder, self.fusion_proj,
+                              self.spatio_proj, self.spatiotemp_proj]
+            fusion_ids = {id(p) for m in fusion_modules for p in m.parameters()}
+            param_groups = [
+                {'params': [p for p in self.parameters() if id(p) not in fusion_ids], 'lr': self.lr},
+                {'params': [p for p in self.parameters() if id(p) in fusion_ids], 'lr': self.fusion_lr},
+            ]
+        else:
+            param_groups = self.parameters()
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
-            lr=self.lr, 
-            eps=1e-8, 
-            weight_decay=0.01, 
+            param_groups,
+            lr=self.lr,
+            eps=1e-8,
+            weight_decay=0.01,
             betas=(0.9, 0.98)
         )
         

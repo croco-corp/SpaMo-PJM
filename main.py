@@ -193,7 +193,21 @@ def configure_callbacks(
             )
         )
         callbacks.append(
-            EarlyStopping(monitor=model.monitor, verbose=True, patience=50, mode="max") # pyright: ignore[reportArgumentType]
+            EarlyStopping(monitor=model.monitor, verbose=True, patience=8, mode="max") # pyright: ignore[reportArgumentType]
+        )
+    elif opt.evaluation == "retrieval":
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=ckptdir,
+                filename="epoch={epoch:05}-step={step:07}-algap={val/alignment_gap:.4f}",
+                monitor=model.monitor, # pyright: ignore[reportArgumentType]
+                auto_insert_metric_name=False,
+                save_top_k=1,
+                mode="max",
+            )
+        )
+        callbacks.append(
+            EarlyStopping(monitor=model.monitor, verbose=True, patience=8, mode="max") # pyright: ignore[reportArgumentType]
         )
     else:
         callbacks.append(
@@ -207,7 +221,7 @@ def configure_callbacks(
             )
         )
         callbacks.append(
-            EarlyStopping(monitor=model.monitor, verbose=True, patience=50, mode="min") # pyright: ignore[reportArgumentType]
+            EarlyStopping(monitor=model.monitor, verbose=True, patience=8, mode="min") # pyright: ignore[reportArgumentType]
         )
 
     # Setup callback for logging configuration
