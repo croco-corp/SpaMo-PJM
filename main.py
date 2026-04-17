@@ -98,6 +98,9 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-e", "--evaluation", type=str, default="mse", help="Evaluation metric to use"
     )
+    parser.add_argument(
+        "--tags", nargs="*", default=[], help="W&B tags for this run, e.g. --tags ms-split 4-stream generation"
+    )
     return parser
 
 
@@ -240,25 +243,32 @@ def configure_callbacks(
     return callbacks
 
 
-def configure_logger(logger_type: str, logdir: str, nowname: str) -> dict:
+def configure_logger(logger_type: str, logdir: str, nowname: str, config: dict | None = None, tags: list | None = None) -> dict:
     """Configure the logger.
 
     Args:
         logger_type: Type of logger to use
         logdir: Directory for logs
         nowname: Name for the current run
+        config: Experiment configuration dictionary to save with the W&B run
 
     Returns:
         Logger configuration
     """
+    wandb_params: dict = {
+        "name": nowname,
+        "save_dir": logdir,
+        "id": nowname,
+    }
+    if config is not None:
+        wandb_params["config"] = config
+    if tags:
+        wandb_params["tags"] = tags
+
     logger_configs = {
         "wandb": {
             "target": "pytorch_lightning.loggers.WandbLogger",
-            "params": {
-                "name": nowname,
-                "save_dir": logdir,
-                "id": nowname,
-            },
+            "params": wandb_params,
         },
         "testtube": {
             "target": "pytorch_lightning.loggers.TestTubeLogger",
@@ -328,7 +338,21 @@ def main():
 
     # Configure trainer with callbacks and logger for non-dev runs
     if not opt.fast_dev_run:
-        logger_cfg = configure_logger("wandb", logdir, nowname)
+        # Build a flat experiment config dict for W&B from model/data params + CLI args
+        experiment_config: dict = {}
+        if "model" in config and "params" in config.model:  # pyright: ignore[reportAttributeAccessIssue]
+            experiment_config.update(
+                OmegaConf.to_container(config.model.params, resolve=True)  # type: ignore[arg-type]
+            )
+        if "data" in config and "params" in config.data:  # pyright: ignore[reportAttributeAccessIssue]
+            experiment_config["data"] = OmegaConf.to_container(
+                config.data.params, resolve=True
+            )
+        experiment_config["seed"] = opt.seed
+        experiment_config["evaluation"] = opt.evaluation
+        experiment_config["config_files"] = opt.config
+
+        logger_cfg = configure_logger("wandb", logdir, nowname, config=experiment_config, tags=opt.tags)
         trainer_opt.logger = instantiate_from_config(logger_cfg)
 
         trainer_opt.callbacks = configure_callbacks(
