@@ -28,6 +28,8 @@ from multiprocessing import Process, Queue
 import h5py
 import lmdb
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
 import msgpack
 import numpy as np
 import torch
@@ -60,8 +62,8 @@ def crop_frame(image: Image.Image, crop_params: dict, output_size=(224, 224)) ->
 
 
 def hand_bbox(landmarks, img_w: int, img_h: int, pad: float = HAND_CROP_PAD):
-    xs = [lm.x * img_w for lm in landmarks.landmark]
-    ys = [lm.y * img_h for lm in landmarks.landmark]
+    xs = [lm.x * img_w for lm in landmarks]
+    ys = [lm.y * img_h for lm in landmarks]
     x1, x2 = min(xs), max(xs)
     y1, y2 = min(ys), max(ys)
     pw = (x2 - x1) * pad
@@ -83,13 +85,26 @@ def iter_tar_names(tars_dir: str, tar_names: list):
 
 
 def cpu_worker(worker_id: int, tar_names: list, tars_dir: str,
-               crop_params_path: str, out_queue: Queue, already_done: set):
+               crop_params_path: str, out_queue: Queue, already_done: set,
+               hand_model_path: str):
     """CPU worker: detects hand crops and puts numpy arrays into the queue."""
     log = logging.getLogger(f"cpu-{worker_id}")
+    try:
+        _cpu_worker_inner(worker_id, tar_names, tars_dir, crop_params_path, out_queue, already_done, log,
+                          hand_model_path)
+    except Exception as e:
+        log.error(f"Worker {worker_id} crashed: {e}")
+    finally:
+        out_queue.put(("done", worker_id))
 
-    hands_detector = mp.solutions.hands.Hands(
-        static_image_mode=True, max_num_hands=2, model_complexity=1,
-    )
+
+def _cpu_worker_inner(worker_id, tar_names, tars_dir, crop_params_path, out_queue, already_done, log,
+                      hand_model_path):
+    hands_detector = HandLandmarker.create_from_options(HandLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=hand_model_path),
+        num_hands=2,
+        running_mode=RunningMode.IMAGE,
+    ))
     lmdb_env = lmdb.open(crop_params_path, readonly=True, lock=False)
 
     for key, mp4_bytes in iter_tar_names(tars_dir, tar_names):
@@ -109,11 +124,12 @@ def cpu_worker(worker_id: int, tar_names: list, tars_dir: str,
             for frame in frames:
                 cropped = crop_frame(frame, crop_params)
                 rgb = np.array(cropped.convert("RGB"))
-                result = hands_detector.process(rgb)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = hands_detector.detect(mp_img)
                 h, w = rgb.shape[:2]
                 n = 0
-                if result.multi_hand_landmarks:
-                    for hand_lm in result.multi_hand_landmarks:
+                if result.hand_landmarks:
+                    for hand_lm in result.hand_landmarks:
                         x1, y1, x2, y2 = hand_bbox(hand_lm, w, h)
                         if x2 > x1 and y2 > y1:
                             crops_list.append(rgb[y1:y2, x1:x2].copy())
@@ -127,15 +143,16 @@ def cpu_worker(worker_id: int, tar_names: list, tars_dir: str,
 
     lmdb_env.close()
     hands_detector.close()
-    out_queue.put(("done", worker_id))
     log.info("Worker finished.")
 
 
 @torch.no_grad()
 def encode_crops(crops: list, processor, model, device: str) -> np.ndarray:
     inputs = processor(images=crops, return_tensors="pt").to(device)
-    hidden = model(**inputs, output_hidden_states=True).hidden_states[-1]
-    return hidden[:, 0].float().cpu().numpy()
+    hidden = model(**inputs, output_hidden_states=True).hidden_states[-1]  # [N, seq, 1024]
+    cls = hidden[:, 0]               # [N, 1024]
+    patch_mean = hidden[:, 1:].mean(1)  # [N, 1024]
+    return torch.cat([cls, patch_mean], dim=-1).float().cpu().numpy()  # [N, 2048]
 
 
 def gpu_writer(out_queue: Queue, n_workers: int, args, processed: set):
@@ -231,6 +248,7 @@ def main():
     parser.add_argument("--flush-every", type=int, default=500)
     parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() - 2),
                         help="CPU workers for MediaPipe detection (default: nproc-2)")
+    parser.add_argument("--hand-model", default="models/hand_landmarker.task")
     parser.add_argument("--dry-run", action="store_true", help="Count videos and exit without processing")
     args = parser.parse_args()
 
@@ -264,7 +282,8 @@ def main():
     for i, chunk in enumerate(chunks):
         p = Process(
             target=cpu_worker,
-            args=(i, chunk, args.tars_dir, args.crop_params_path, out_queue, processed),
+            args=(i, chunk, args.tars_dir, args.crop_params_path, out_queue, processed,
+                  args.hand_model),
             daemon=True,
         )
         p.start()

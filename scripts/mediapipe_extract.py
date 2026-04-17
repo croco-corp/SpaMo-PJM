@@ -21,11 +21,17 @@ import tarfile
 import time
 from multiprocessing import Process, Value
 
+import mediapipe as mp
 import h5py
 import lmdb
-import mediapipe as mp
 import msgpack
 import numpy as np
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python.vision import (
+    HandLandmarker, HandLandmarkerOptions,
+    PoseLandmarker, PoseLandmarkerOptions,
+    RunningMode,
+)
 from PIL import Image
 from PIL.ImageOps import pad as resize_and_pad
 from av import open as av_open
@@ -53,25 +59,35 @@ def crop_frame(image: Image.Image, crop_params: dict, output_size=(224, 224)) ->
     return resize_and_pad(cropped, output_size)
 
 
-def extract_landmarks(results) -> np.ndarray:
-    """Pack MediaPipe Holistic results into a flat float32 vector of length 258."""
+def extract_landmarks(pose_result, hand_result) -> np.ndarray:
+    """Pack MediaPipe Tasks results into a flat float32 vector of length 258."""
     vec = np.zeros(FEAT_DIM, dtype=np.float32)
 
-    if results.pose_landmarks:
-        for i, lm in enumerate(results.pose_landmarks.landmark):
+    if pose_result.pose_landmarks:
+        for i, lm in enumerate(pose_result.pose_landmarks[0]):
             vec[i * 4:i * 4 + 4] = [lm.x, lm.y, lm.z, lm.visibility]
 
-    offset = POSE_DIM
-    if results.left_hand_landmarks:
-        for i, lm in enumerate(results.left_hand_landmarks.landmark):
-            vec[offset + i * 3:offset + i * 3 + 3] = [lm.x, lm.y, lm.z]
-
-    offset = POSE_DIM + HAND_DIM
-    if results.right_hand_landmarks:
-        for i, lm in enumerate(results.right_hand_landmarks.landmark):
-            vec[offset + i * 3:offset + i * 3 + 3] = [lm.x, lm.y, lm.z]
+    if hand_result.hand_landmarks:
+        for landmarks, handedness_list in zip(hand_result.hand_landmarks, hand_result.handedness):
+            label = handedness_list[0].category_name  # "Left" or "Right"
+            offset = POSE_DIM if label == "Left" else POSE_DIM + HAND_DIM
+            for i, lm in enumerate(landmarks):
+                vec[offset + i * 3:offset + i * 3 + 3] = [lm.x, lm.y, lm.z]
 
     return vec
+
+
+def create_detectors(pose_model_path: str, hand_model_path: str):
+    pose_det = PoseLandmarker.create_from_options(PoseLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=pose_model_path),
+        running_mode=RunningMode.IMAGE,
+    ))
+    hand_det = HandLandmarker.create_from_options(HandLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=hand_model_path),
+        num_hands=2,
+        running_mode=RunningMode.IMAGE,
+    ))
+    return pose_det, hand_det
 
 
 def iter_tar_names(tars_dir: str, tar_names: list):
@@ -89,22 +105,18 @@ def iter_tar_names(tars_dir: str, tar_names: list):
 
 def run_worker(worker_id: int, tar_names: list, tars_dir: str,
                crop_params_path: str, part_path: str,
-               already_done: set, flush_every: int, counter: Value):
+               already_done: set, flush_every: int, counter: Value,
+               pose_model_path: str, hand_model_path: str):
     """Worker process: handles a subset of tar files, writes to part_path."""
     log = logging.getLogger(f"worker-{worker_id}")
 
-    # Resume from existing part file
     done = set(already_done)
     if os.path.exists(part_path):
         with h5py.File(part_path, "r") as f:
             done |= set(f.keys())
 
     lmdb_env = lmdb.open(crop_params_path, readonly=True, lock=False)
-    holistic = mp.solutions.holistic.Holistic(
-        static_image_mode=True,
-        model_complexity=1,
-        enable_segmentation=False,
-    )
+    pose_det, hand_det = create_detectors(pose_model_path, hand_model_path)
 
     newly = errors = 0
     start = time.time()
@@ -125,8 +137,10 @@ def run_worker(worker_id: int, tar_names: list, tars_dir: str,
                 for frame in frames:
                     cropped = crop_frame(frame, crop_params)
                     rgb = np.array(cropped.convert("RGB"))
-                    result = holistic.process(rgb)
-                    feats.append(extract_landmarks(result))
+                    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    pose_result = pose_det.detect(mp_img)
+                    hand_result = hand_det.detect(mp_img)
+                    feats.append(extract_landmarks(pose_result, hand_result))
 
                 arr = np.stack(feats, axis=0)
                 hf.create_dataset(key, data=arr, dtype="float32")
@@ -146,7 +160,8 @@ def run_worker(worker_id: int, tar_names: list, tars_dir: str,
         hf.flush()
 
     lmdb_env.close()
-    holistic.close()
+    pose_det.close()
+    hand_det.close()
     elapsed = time.time() - start
     log.info(f"Finished: newly={newly:,} errors={errors} time={elapsed/60:.1f}min")
 
@@ -154,13 +169,13 @@ def run_worker(worker_id: int, tar_names: list, tars_dir: str,
 def merge_parts(output_path: str, part_paths: list):
     """Merge all part H5 files into the final output, then delete parts."""
     logger.info("Merging parts...")
-    with h5py.File(output_path, "a") as hf_out:
+    with h5py.File(output_path, "a", locking=False) as hf_out:
         hf_out.attrs.setdefault("feat_dim", FEAT_DIM)
         hf_out.attrs.setdefault("description", "pose(33x4) + left_hand(21x3) + right_hand(21x3)")
         for part in part_paths:
             if not os.path.exists(part):
                 continue
-            with h5py.File(part, "r") as hf_in:
+            with h5py.File(part, "r", locking=False) as hf_in:
                 for key in hf_in:
                     if key not in hf_out:
                         hf_in.copy(key, hf_out)
@@ -176,6 +191,8 @@ def main():
     parser.add_argument("--flush-every", type=int, default=500)
     parser.add_argument("--num-workers", type=int, default=os.cpu_count(),
                         help="Number of parallel processes (default: all CPUs)")
+    parser.add_argument("--pose-model", default="models/pose_landmarker_full.task")
+    parser.add_argument("--hand-model", default="models/hand_landmarker.task")
     parser.add_argument("--dry-run", action="store_true", help="Count videos and exit without processing")
     args = parser.parse_args()
 
@@ -211,7 +228,8 @@ def main():
         p = Process(
             target=run_worker,
             args=(i, chunk, args.tars_dir, args.crop_params_path,
-                  part_path, processed, args.flush_every, counter),
+                  part_path, processed, args.flush_every, counter,
+                  args.pose_model, args.hand_model),
             daemon=True,
         )
         p.start()
