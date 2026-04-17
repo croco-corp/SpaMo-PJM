@@ -2,14 +2,14 @@ model:
   target: spamo.t5_slt.FlanT5SLT
 
   params:
-    lr: 6.0e-4
-    fusion_lr: 6.0e-5
-    monitor: val/alignment_gap
+    lr: 1.0e-4
+    fusion_lr: 1.0e-5
+    monitor: val/loss
     model_name: google/flan-t5-xl
     cache_dir: /home/croco/.cache/huggingface/hub
     inter_hidden: 768
     input_size: 2048
-    beam_size: 5
+    beam_size: 4
     max_frame_len: 512
     max_txt_len: 64
     frame_sample_rate: 1
@@ -22,26 +22,28 @@ model:
     fusion_mode: joint
     warm_up_steps: null
     cross_modal_align: true
-    combined_loss: false
-    alpha: 1.0
+    combined_loss: true
+    alpha: 0.1
     use_in_context: false
     num_in_context: 0
     queue_size: 4096
-    motion_input_size: 2048   # hand_vit_feat dim
+    keypoint_dim: 258
+    aux_input_size: 2048
+    motion_input_size: 1024
+    lr_patience: 5
+    lr_scheduler_mode: min
 
 lightning:
   callback:
     learning_rate_logger:
       target: pytorch_lightning.callbacks.LearningRateMonitor
       params:
-        logging_interval: step
+        logging_interval: epoch
   trainer:
     accumulate_grad_batches: 1
     accelerator: gpu
     devices: 1
-    max_epochs: 60
-    gradient_clip_val: 1.0
-    check_val_every_n_epoch: 2
+    max_epochs: 1
     precision: bf16
 
 data:
@@ -50,11 +52,13 @@ data:
     batch_size: 8
     num_workers: 4
     visual_features_path: features/vit_feat_pjm.h5
-    motion_features_path: features/hand_vit_feat_pjm.h5   # hand-crop ViT instead of VideoMAE
+    motion_features_path: features/mae_feat_pjm.h5
+    aux_features_path: features/hand_vit_feat_pjm.h5
+    keypoint_features_path: features/mediapipe_feat_pjm.h5
     texts_path: features/texts_eng.h5
     train_split_path: /home/croco/CrocoSign/data/split_train_filtered.csv
     val_split_path: /home/croco/CrocoSign/data/split_val_filtered.csv
-    test_split_path: /home/croco/CrocoSign/data/split_test_filtered.csv
+    test_split_path: /home/croco/CrocoSign/data/split_train_filtered.csv
     device: cuda
     max_frame_length: 512
     set_to_test: test
