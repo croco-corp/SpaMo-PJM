@@ -1,9 +1,12 @@
+import logging
 import os
 import torch
 import torch.nn as nn
 import random
 import math
 from typing import Dict, List, Optional, Tuple, Any
+
+log = logging.getLogger(__name__)
 
 import torch.nn.functional as F
 
@@ -18,7 +21,6 @@ from spamo.mm_projector import build_vision_projector
 from utils.evaluate import evaluate_results
 from spamo.clip_loss import clip_loss
 from spamo.asb import AbstractSLT
-from transformers import get_cosine_schedule_with_warmup
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -58,6 +60,10 @@ class FlanT5SLT(AbstractSLT):
         fusion_lr: Optional[float] = None,
         queue_size: int = 0,
         keypoint_dim: int = 0,
+        aux_input_size: int = 0,
+        motion_input_size: int = 0,
+        lr_patience: int = 5,
+        lr_scheduler_mode: str = 'max',
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -88,8 +94,16 @@ class FlanT5SLT(AbstractSLT):
         self.fusion_lr = fusion_lr
         self.queue_size = queue_size
         self.keypoint_dim = keypoint_dim
+        self.aux_input_size = aux_input_size
+        self.motion_input_size = motion_input_size if motion_input_size > 0 else input_size
+        self.lr_patience = lr_patience
+        self.lr_scheduler_mode = lr_scheduler_mode
 
         self.prepare_models(model_name)
+
+        # Aux stream projector: e.g. hand-crop ViT [T, aux_input_size] → [T, inter_hidden]
+        if self.aux_input_size > 0:
+            self.aux_proj = build_vision_projector('linear', aux_input_size, self.inter_hidden)
 
         # Keypoint projector: MediaPipe [T, keypoint_dim] → [T, d_model]
         if self.keypoint_dim > 0:
@@ -136,8 +150,17 @@ class FlanT5SLT(AbstractSLT):
     
     def load_pretrained_weights(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.load_state_dict(checkpoint['state_dict'])
-        print(f'Checkpoint is loaded from {checkpoint_path}.')
+        ckpt_sd = checkpoint['state_dict']
+        model_sd = self.state_dict()
+        compatible = {
+            k: v for k, v in ckpt_sd.items()
+            if k in model_sd and v.shape == model_sd[k].shape
+        }
+        self.load_state_dict(compatible, strict=False)
+        skipped = [k for k in ckpt_sd if k not in compatible]
+        log.info(f'Checkpoint loaded from {checkpoint_path}: {len(compatible)}/{len(ckpt_sd)} params.')
+        if skipped:
+            log.warning(f'Skipped {len(skipped)} incompatible keys: {skipped}')
 
     def _apply_lora(self) -> None:
         """Apply LoRA adapter to the T5 model."""
@@ -194,7 +217,7 @@ class FlanT5SLT(AbstractSLT):
 
         # Load the vision projectors
         self.spatio_proj = build_vision_projector('linear', self.input_size, self.inter_hidden)
-        self.spatiotemp_proj = build_vision_projector('linear', 1024, self.inter_hidden)
+        self.spatiotemp_proj = build_vision_projector('linear', self.motion_input_size, self.inter_hidden)
         self.fusion_proj = build_vision_projector('mlp2x_gelu', self.inter_hidden, self.t5_model.config.hidden_size, dropout=self.fusion_dropout)
 
         # Load the temporal encoder
@@ -304,19 +327,32 @@ class FlanT5SLT(AbstractSLT):
             spatiotemporal_outputs = self.spatiotemp_proj(spatiotemporal_outputs)
             spatiotemporal_mask = create_mask(seq_lengths=samples['glor_lengths'], device=self.device)
         
+        # Process aux stream if available
+        aux_outputs = aux_mask = None
+        if self.aux_input_size > 0 and samples.get('aux_values'):
+            aux_padded = pad_sequence(samples['aux_values'], batch_first=True).to(self.device)
+            aux_outputs = self.aux_proj(aux_padded)
+            aux_mask = create_mask(seq_lengths=samples['aux_lengths'], device=self.device)
+
         # Combine features for joint mode
         if self.fusion_mode == 'joint':
             bs = spatial_outputs.shape[0]
             spatial_length = spatial_mask.sum(1)
             spatiotemporal_length = spatiotemporal_mask.sum(1)
             new_length = spatial_length + spatiotemporal_length
-            
-            # Concatenate spatial and spatiotemporal features for each sample
+            if aux_outputs is not None:
+                aux_length = aux_mask.sum(1)
+                new_length = new_length + aux_length
+
+            # Concatenate spatial, spatiotemporal (and optional aux) for each sample
             joint_outputs = []
             for i in range(bs):
                 valid_spatial_output = spatial_outputs[i, :spatial_length[i], :]
                 valid_spatiotemporal_output = spatiotemporal_outputs[i, :spatiotemporal_length[i], :]
-                concat_sample = torch.cat((valid_spatial_output, valid_spatiotemporal_output), dim=0)
+                parts = [valid_spatial_output, valid_spatiotemporal_output]
+                if aux_outputs is not None:
+                    parts.append(aux_outputs[i, :aux_length[i], :])
+                concat_sample = torch.cat(parts, dim=0)
                 joint_outputs.append(concat_sample)
             joint_outputs = pad_sequence(joint_outputs, batch_first=True)
             
@@ -363,6 +399,7 @@ class FlanT5SLT(AbstractSLT):
         texts, speaker_ids = [], []
         num_frames, glor_lengths, langs = [], [], []
         keypoint_values = []
+        aux_values, aux_lengths = [], []
         ex_lang_translations = []
         
         max_frame_len = self.max_frame_len
@@ -411,6 +448,13 @@ class FlanT5SLT(AbstractSLT):
                 kp = sample.get('keypoint_value')
                 if kp is not None:
                     keypoint_values.append(kp[::self.frame_sample_rate])
+
+                # Collect aux stream if available
+                aux = sample.get('aux_value')
+                if aux is not None:
+                    aux_sampled = aux[::self.frame_sample_rate]
+                    aux_values.append(aux_sampled)
+                    aux_lengths.append(len(aux_sampled))
         
         ex_lang_translations = derangement(ex_lang_translations)
         
@@ -426,6 +470,8 @@ class FlanT5SLT(AbstractSLT):
             'num_frames': num_frames,
             'glor_lengths': glor_lengths,
             'keypoint_values': keypoint_values,
+            'aux_values': aux_values,
+            'aux_lengths': aux_lengths,
         }
 
     def visual_textual_align(self, visual_outputs: torch.Tensor, visual_masks: torch.Tensor, samples: Dict) -> torch.Tensor:
@@ -603,7 +649,7 @@ class FlanT5SLT(AbstractSLT):
                 generated = self.t5_model.generate(
                     inputs_embeds=input_embeds,
                     attention_mask=input_masks,
-                    num_beams=5,
+                    num_beams=self.beam_size,
                     max_length=self.max_txt_len,
                     top_p=0.9,
                     do_sample=True,
@@ -679,82 +725,7 @@ class FlanT5SLT(AbstractSLT):
         return sharpened.mean(dim=0).float()                        # [dec, enc]
 
     def _log_xai_diagnostics(self, split: str, cos_sims: 'torch.Tensor | None') -> None:
-        if not self.logger or not hasattr(self.logger, 'experiment'):
-            return
-        import wandb, statistics
-        from sacrebleu.metrics import CHRF as SacreCHRF
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        # B: per-sample cosine_sim vs sentence-level ChrF scatter
-        if cos_sims is not None and len(self.references) == len(cos_sims):
-            chrf_scores = [
-                SacreCHRF().sentence_score(pred, [ref]).score
-                for pred, ref in zip(self.generated, self.references)
-            ]
-            scatter_table = wandb.Table(
-                columns=["cosine_sim", "chrf", "reference", "generated"],
-                data=[
-                    [float(cos_sims[i].item()), chrf_scores[i], self.references[i], self.generated[i]]
-                    for i in range(len(self.references))
-                ],
-            )
-            self.logger.experiment.log({f"{split}/cosine_vs_chrf": scatter_table, "trainer/global_step": self.global_step})
-
-        # A + D: attention heatmap + token-frame cosine sim — run only every 10 epochs
-        if self.diag_batch is None or self.current_epoch % 10 != 0:
-            return
-
-        db = self.diag_batch
-        with torch.no_grad():
-            diag_out = self.t5_model(
-                inputs_embeds=db['input_embeds'],
-                attention_mask=db['input_masks'],
-                decoder_input_ids=db['output_ids'],
-                decoder_attention_mask=db['output_mask'],
-                output_attentions=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-        xai_images = {}
-        for i in range(db['input_embeds'].shape[0]):
-            # A: cross-attention heatmap
-            try:
-                sample_attn = tuple(layer[i:i+1] for layer in diag_out.cross_attentions)
-                heatmap = self._aggregate_cross_attention(sample_attn).cpu().numpy()
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.imshow(heatmap, aspect='auto', cmap='viridis')
-                ax.set_xlabel("Visual frame position")
-                ax.set_ylabel("Generated token")
-                ref_tokens = self.t5_tokenizer.convert_ids_to_tokens(db['output_ids'][i].tolist(), skip_special_tokens=True)
-                ax.set_yticks(range(len(ref_tokens)))
-                ax.set_yticklabels(ref_tokens, fontsize=7)
-                ax.set_title(f"Ref: {db['ref_strings'][i][:60]}")
-                fig.tight_layout()
-                xai_images[f"{split}/xai_attention_{i}"] = wandb.Image(fig)
-                plt.close(fig)
-            except NotImplementedError:
-                pass
-
-            # D: token-frame cosine similarity matrix
-            dec_h = diag_out.decoder_hidden_states[-1][i].float()   # [dec_seq, hidden]
-            enc_h = db['input_embeds'][i].float()                    # [enc_seq, hidden]
-            tf_sim = (F.normalize(dec_h, dim=-1) @ F.normalize(enc_h, dim=-1).T).cpu().numpy()
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.imshow(tf_sim, aspect='auto', cmap='RdBu', vmin=-1, vmax=1)
-            ax.set_xlabel("Visual frame position")
-            ax.set_ylabel("Decoder token position")
-            ax.set_title(f"Token-frame cosine sim | ref: {db['ref_strings'][i][:60]}")
-            fig.tight_layout()
-            xai_images[f"{split}/xai_token_frame_{i}"] = wandb.Image(fig)
-            plt.close(fig)
-
-        if xai_images:
-            xai_images["trainer/global_step"] = self.global_step
-            self.logger.experiment.log(xai_images)
+        pass
 
     def _compute_retrieval_metrics(self, split: str) -> None:
         """Alignment gap + R@1/5/10 using T5 encoder as text tower."""
@@ -924,6 +895,8 @@ class FlanT5SLT(AbstractSLT):
         if self.fusion_lr is not None:
             fusion_modules = [self.temporal_encoder, self.fusion_proj,
                               self.spatio_proj, self.spatiotemp_proj]
+            if self.aux_input_size > 0:
+                fusion_modules.append(self.aux_proj)
             if self.keypoint_dim > 0:
                 fusion_modules.append(self.kp_proj)
             fusion_ids = {id(p) for m in fusion_modules for p in m.parameters()}
@@ -941,36 +914,20 @@ class FlanT5SLT(AbstractSLT):
             betas=(0.9, 0.98)
         )
         
-        # Calculate total steps based on PyTorch Lightning trainer settings
-        if hasattr(self.trainer, 'estimated_stepping_batches'):
-            total_steps = self.trainer.estimated_stepping_batches
-        else:
-            # Fallback calculation if the attribute doesn't exist
-            max_epochs = self.trainer.max_epochs
-            train_dataloader = self.trainer.train_dataloader
-            if hasattr(train_dataloader, 'dataloader'):
-                train_dataloader = train_dataloader.dataloader
-            
-            batches_per_epoch = len(train_dataloader)
-            total_steps = batches_per_epoch * max_epochs
-            
-            # Account for gradient accumulation if used
-            if hasattr(self.trainer, 'accumulate_grad_batches'):
-                total_steps = total_steps // self.trainer.accumulate_grad_batches
-        
-        warmup_steps = int(total_steps * 0.1)
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps,
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=self.lr_scheduler_mode,
+            factor=0.5,
+            patience=self.lr_patience,
+            min_lr=1e-6,
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",
+                "interval": "epoch",
                 "frequency": 1,
+                "monitor": self.monitor,
             },
         }
