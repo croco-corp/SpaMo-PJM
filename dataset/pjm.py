@@ -39,6 +39,11 @@ class PJMKorpus(torch.utils.data.Dataset):
 
         all_keys = sorted(visual_h5.keys())
         idx_to_key = [k for k in all_keys if k in keys] if keys else all_keys
+        # TemporalConv conv_type=2 = [K5, P2, K5, P2] requires >= ~16 input frames.
+        # Defensive filter — upstream PJM port crashed on short samples; fork pipeline
+        # apparently coped historically but no harm filtering ~8% of MS samples.
+        min_frames = 16
+        idx_to_key = [k for k in idx_to_key if visual_h5[k].shape[0] >= min_frames]
         self.samples = [
             (key, texts_h5[key][()].decode(), speaker_map.get(key, 'unknown'))
             for key in idx_to_key
