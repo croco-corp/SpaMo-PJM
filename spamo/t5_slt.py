@@ -18,10 +18,11 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 from spamo.tconv import TemporalConv
 from utils.helpers import create_mask, derangement
-from spamo.mm_projector import build_vision_projector
+from spamo.mm_projector import build_vision_projector, CrossAttention
 from utils.evaluate import evaluate_results
 from spamo.clip_loss import clip_loss
 from spamo.asb import AbstractSLT
+from spamo.callbacks import dump_test_outputs
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -59,6 +60,7 @@ class FlanT5SLT(AbstractSLT):
         lora_dropout: float = 0.1,
         fusion_dropout: float = 0.0,
         fusion_lr: Optional[float] = None,
+        new_stream_lr: Optional[float] = None,
         queue_size: int = 0,
         keypoint_dim: int = 0,
         aux_input_size: int = 0,
@@ -94,6 +96,7 @@ class FlanT5SLT(AbstractSLT):
         self.lora_dropout = lora_dropout
         self.fusion_dropout = fusion_dropout
         self.fusion_lr = fusion_lr
+        self.new_stream_lr = new_stream_lr
         self.queue_size = queue_size
         self.keypoint_dim = keypoint_dim
         self.aux_input_size = aux_input_size
@@ -108,15 +111,21 @@ class FlanT5SLT(AbstractSLT):
         if self.aux_input_size > 0:
             self.aux_proj = build_vision_projector('linear', aux_input_size, self.inter_hidden)
 
-        # Keypoint projector: MediaPipe [T, keypoint_dim] → [T, d_model]
+        # Keypoint projector: MediaPipe [T, keypoint_dim] → [T, inter_hidden]
         if self.keypoint_dim > 0:
-            d_model = self.t5_model.config.d_model
             self.kp_proj = nn.Sequential(
                 nn.Linear(keypoint_dim, inter_hidden),
                 nn.LayerNorm(inter_hidden),
                 nn.GELU(),
-                nn.Linear(inter_hidden, d_model),
+                nn.Linear(inter_hidden, inter_hidden),
             )
+        # Cross-attention enrichment for quad streams.
+        # aux/kp enrich V tokens in-place (no prefix length change) — dual ckpt compatible.
+        # Zero-init proj → identity forward on step 0 → init BLEU = dual baseline.
+        if self.aux_input_size > 0 or self.keypoint_dim > 0:
+            self.aux_xattn = CrossAttention(self.inter_hidden, num_heads=8, qkv_bias=True)
+            nn.init.zeros_(self.aux_xattn.proj.weight)
+            nn.init.zeros_(self.aux_xattn.proj.bias)
 
         # Memory bank for contrastive learning (queue of past visual embeddings)
         if self.queue_size > 0:
@@ -212,10 +221,10 @@ class FlanT5SLT(AbstractSLT):
         # Load the vision projectors
         self.spatio_proj = build_vision_projector('linear', self.input_size, self.inter_hidden)
         self.spatiotemp_proj = build_vision_projector('linear', self.motion_input_size, self.inter_hidden)
-        self.fusion_proj = build_vision_projector('mlp2x_gelu', self.inter_hidden, self.t5_model.config.hidden_size, dropout=self.fusion_dropout)
+        self.fusion_proj = build_vision_projector('mlp2x_gelu', self.inter_hidden, self.t5_model.config.hidden_size)
 
         # Load the temporal encoder
-        self.temporal_encoder = TemporalConv(self.inter_hidden, self.inter_hidden, dropout=self.fusion_dropout)
+        self.temporal_encoder = TemporalConv(self.inter_hidden, self.inter_hidden)
 
         # if self.cross_modal_align:
         self.logit_scale = nn.Parameter(torch.tensor(2.6592))
@@ -321,31 +330,43 @@ class FlanT5SLT(AbstractSLT):
             spatiotemporal_outputs = self.spatiotemp_proj(spatiotemporal_outputs)
             spatiotemporal_mask = create_mask(seq_lengths=samples['glor_lengths'], device=self.device)
         
-        # Process aux stream if available
-        aux_outputs = aux_mask = None
+        # Project aux (hand_ViT) and keypoint (MediaPipe) streams to inter_hidden space.
+        # Both remain None when the stream is disabled (dual mode).
+        aux_outputs = kp_outputs = None
         if self.aux_input_size > 0 and samples.get('aux_values'):
             aux_padded = pad_sequence(samples['aux_values'], batch_first=True).to(self.device)
-            aux_outputs = self.aux_proj(aux_padded)
-            aux_mask = create_mask(seq_lengths=samples['aux_lengths'], device=self.device)
+            aux_outputs = self.aux_proj(aux_padded)  # [B, T_A, inter_hidden]
 
-        # Combine features for joint mode
+        if self.keypoint_dim > 0 and samples.get('keypoint_values'):
+            kp_padded = pad_sequence(samples['keypoint_values'], batch_first=True).to(self.device)
+            kp_outputs = self.kp_proj(kp_padded)  # [B, T_K, inter_hidden]
+
+        # Enrich spatial tokens with aux/kp context via cross-attention.
+        # Prefix length stays [V+M] — same as dual — so T5 sees its trained prefix shape.
+        if hasattr(self, 'aux_xattn'):
+            context_parts = []
+            if aux_outputs is not None:
+                context_parts.append(aux_outputs)
+            if kp_outputs is not None:
+                context_parts.append(kp_outputs)
+            if context_parts:
+                context = torch.cat(context_parts, dim=1)  # [B, T_A+T_K, inter_hidden]
+                spatial_outputs = spatial_outputs + self.aux_xattn(spatial_outputs, context)
+
+        # Combine spatial (optionally enriched) + motion — dual layout preserved
         if self.fusion_mode == 'joint':
             bs = spatial_outputs.shape[0]
             spatial_length = spatial_mask.sum(1)
             spatiotemporal_length = spatiotemporal_mask.sum(1)
             new_length = spatial_length + spatiotemporal_length
-            if aux_outputs is not None:
-                aux_length = aux_mask.sum(1)
-                new_length = new_length + aux_length
 
-            # Concatenate spatial, spatiotemporal (and optional aux) for each sample
+            # Concatenate spatial + spatiotemporal (aux/kp already fused into spatial above)
             joint_outputs = []
             for i in range(bs):
                 valid_spatial_output = spatial_outputs[i, :spatial_length[i], :]
                 valid_spatiotemporal_output = spatiotemporal_outputs[i, :spatiotemporal_length[i], :]
                 parts = [valid_spatial_output, valid_spatiotemporal_output]
-                if aux_outputs is not None:
-                    parts.append(aux_outputs[i, :aux_length[i], :])
+
                 concat_sample = torch.cat(parts, dim=0)
                 joint_outputs.append(concat_sample)
             joint_outputs = pad_sequence(joint_outputs, batch_first=True)
@@ -501,11 +522,8 @@ class FlanT5SLT(AbstractSLT):
                 pooled = (roberta_out * mask).sum(1) / mask.sum(1).clamp(min=1)
                 text_embeds = self.text_align_proj(pooled)  
             else:
-                enc_out = self.t5_model.encoder(
-                    input_ids=output_tokens.input_ids,
-                    attention_mask=output_tokens.attention_mask,
-                ).last_hidden_state.float()
-                text_embeds = (enc_out * mask).sum(1) / mask.sum(1).clamp(min=1)
+                tok_embeds = self.t5_model.encoder.embed_tokens(output_tokens.input_ids).float()
+                text_embeds = (tok_embeds * mask).sum(1) / mask.sum(1).clamp(min=1)
 
         # Mean pooling for visual embeddings
         image_embeds = visual_outputs.mean(1)  # [B, d_model]
@@ -563,6 +581,8 @@ class FlanT5SLT(AbstractSLT):
         # Prepare visual inputs and project to match text embedding dimensions
         visual_outputs, visual_masks = self.prepare_visual_inputs(inputs)
         visual_outputs = self.fusion_proj(visual_outputs)
+        if self.fusion_dropout > 0.0:
+            visual_outputs = F.dropout(visual_outputs, p=self.fusion_dropout, training=self.training)
 
         # Initialize logging dictionary
         log_dict = {}
@@ -886,7 +906,10 @@ class FlanT5SLT(AbstractSLT):
             print(f"\033[94mReference: {self.references[i]}\033[0m")  # Blue color for references
             print(f"\033[92mGenerated: {self.generated[i]}\033[0m")    # Green color for generated
             print("-" * 50)
-            
+
+        save_dir = self.logger.save_dir if self.logger and hasattr(self.logger, 'save_dir') else '.'
+        dump_test_outputs(save_dir, self.references, self.generated, logger=self.logger, split='test')
+
         # Calculate evaluation metrics
         eval_res = evaluate_results(
             predictions=self.generated,
@@ -901,17 +924,40 @@ class FlanT5SLT(AbstractSLT):
 
     def configure_optimizers(self):
         if self.fusion_lr is not None:
+            # Already-trained fusion modules: temporal encoder + projectors that exist
+            # in the upstream/v22 base ckpt. Soft-freezed via fusion_lr (typically 10× smaller).
             fusion_modules = [self.temporal_encoder, self.fusion_proj,
                               self.spatio_proj, self.spatiotemp_proj]
+            # New stream projectors added on top of a base ckpt (random init when continuing).
+            # Need higher LR than fusion_lr to learn from scratch quickly. If `new_stream_lr`
+            # is set, they get their own group; otherwise fall back to fusion_lr (legacy
+            # behavior — preserves v9-v23 training dynamics).
+            new_stream_modules = []
             if self.aux_input_size > 0:
-                fusion_modules.append(self.aux_proj)
+                new_stream_modules.append(self.aux_proj)
             if self.keypoint_dim > 0:
-                fusion_modules.append(self.kp_proj)
+                new_stream_modules.append(self.kp_proj)
+            if hasattr(self, 'aux_xattn'):
+                new_stream_modules.append(self.aux_xattn)
+
+            if self.new_stream_lr is None:
+                fusion_modules.extend(new_stream_modules)
+                new_stream_modules = []
+
             fusion_ids = {id(p) for m in fusion_modules for p in m.parameters()}
+            new_stream_ids = {id(p) for m in new_stream_modules for p in m.parameters()}
+            specialized_ids = fusion_ids | new_stream_ids
+
             param_groups = [
-                {'params': [p for p in self.parameters() if id(p) not in fusion_ids], 'lr': self.lr},
+                {'params': [p for p in self.parameters() if id(p) not in specialized_ids], 'lr': self.lr},
                 {'params': [p for p in self.parameters() if id(p) in fusion_ids], 'lr': self.fusion_lr},
             ]
+            if new_stream_modules:
+                param_groups.append({
+                    'params': [p for p in self.parameters() if id(p) in new_stream_ids],
+                    'lr': self.new_stream_lr,
+                })
+                log.info(f"Optimizer: 3 groups (T5+LoRA lr={self.lr}, trained fusion lr={self.fusion_lr}, new streams lr={self.new_stream_lr})")
         else:
             param_groups = self.parameters()
         optimizer = torch.optim.AdamW(
