@@ -4,13 +4,12 @@ import torch.nn as nn
 
 
 class TemporalConv(nn.Module):
-    def __init__(self, input_size, hidden_size, conv_type=2, num_classes=-1, dropout=0.0):
+    def __init__(self, input_size, hidden_size, conv_type=2, num_classes=-1):
         super(TemporalConv, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_classes = num_classes
         self.conv_type = conv_type
-        self.dropout = dropout
 
         if self.conv_type == 0:
             self.kernel_size = ['K3']
@@ -43,8 +42,6 @@ class TemporalConv(nn.Module):
                 )
                 modules.append(nn.BatchNorm1d(self.hidden_size))
                 modules.append(nn.ReLU(inplace=True))
-                if self.dropout > 0.0:
-                    modules.append(nn.Dropout(p=self.dropout))
         self.temporal_conv = nn.Sequential(*modules)
 
         if self.num_classes != -1:
