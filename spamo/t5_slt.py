@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, T5ForConditionalGeneration
 from transformers import BertConfig, BertModel
+from transformers import RobertaModel, RobertaTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
 
 from spamo.tconv import TemporalConv
@@ -62,6 +63,7 @@ class FlanT5SLT(AbstractSLT):
         keypoint_dim: int = 0,
         aux_input_size: int = 0,
         motion_input_size: int = 0,
+        use_frozen_text_encoder: bool = False,
         lr_patience: int = 5,
         lr_scheduler_mode: str = 'max',
         **kwargs
@@ -96,6 +98,7 @@ class FlanT5SLT(AbstractSLT):
         self.keypoint_dim = keypoint_dim
         self.aux_input_size = aux_input_size
         self.motion_input_size = motion_input_size if motion_input_size > 0 else input_size
+        self.use_frozen_text_encoder = use_frozen_text_encoder
         self.lr_patience = lr_patience
         self.lr_scheduler_mode = lr_scheduler_mode
 
@@ -117,7 +120,7 @@ class FlanT5SLT(AbstractSLT):
 
         # Memory bank for contrastive learning (queue of past visual embeddings)
         if self.queue_size > 0:
-            d = self.t5_model.config.d_model
+            d = self.inter_hidden if self.use_frozen_text_encoder else self.t5_model.config.d_model
             self.register_buffer('_vis_queue', F.normalize(torch.randn(queue_size, d), dim=-1))
             self._queue_ptr = 0
 
@@ -127,26 +130,17 @@ class FlanT5SLT(AbstractSLT):
         elif tuning_type == 'lora':
             self._apply_lora()
 
+        if self.use_frozen_text_encoder:
+            self.frozen_text_encoder = RobertaModel.from_pretrained('roberta-large')
+            self.frozen_text_encoder.eval()
+            for p in self.frozen_text_encoder.parameters():
+                p.requires_grad = False
+            # projection RobBERTa hidden 1024 to our inter hidden (768)
+            self.text_align_proj = nn.Linear(1024, self.inter_hidden)
+            self.image_align_proj = nn.Linear(self.t5_model.config.d_model, self.inter_hidden)
         self.set_container()
         self._reset_train_speaker_losses()
 
-    # def load_pretrained_weights(self, checkpoint_path: str) -> None:
-    #     """Load weights from a pretrained checkpoint."""
-    #     checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-        
-    #     # Get model's state dict
-    #     model_state_dict = self.state_dict()
-    #     checkpoint_state_dict = checkpoint['state_dict']
-        
-    #     # Filter out mismatched keys
-    #     filtered_state_dict = {}
-    #     for k, v in checkpoint_state_dict.items():
-    #         if k in model_state_dict and v.size() == model_state_dict[k].size():
-    #             filtered_state_dict[k] = v
-        
-    #     # Load the filtered state dict
-    #     self.load_state_dict(filtered_state_dict)
-    #     print(f'Checkpoint loaded from {checkpoint_path}. Loaded {len(filtered_state_dict)}/{len(checkpoint_state_dict)} parameters.')
     
     def load_pretrained_weights(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -417,8 +411,11 @@ class FlanT5SLT(AbstractSLT):
                 speaker_ids.append(sample.get('speaker_id', 'unknown'))
                 
                 if self.use_in_context:
+                    # Use pl_text if present (PJM EN target — avoids degenerate en==text identity);
+                    # otherwise fall back to en_text (Phoenix DE→DE — paper original).
+                    first_lang = sample.get('pl_text') or sample.get('en_text', sample['text'])
                     _ex_lang_trans = [
-                        f"{sample['en_text']}={sample['text']}",
+                        f"{first_lang}={sample['text']}",
                         f"{sample['fr_text']}={sample['text']}",
                         f"{sample['es_text']}={sample['text']}"
                     ]
@@ -494,23 +491,34 @@ class FlanT5SLT(AbstractSLT):
         ).to(self.device)
         
         # Get text embeddings via T5 encoder (frozen, no grad) with masked mean pooling
-        with torch.no_grad():
-            enc_out = self.t5_model.encoder(
-                input_ids=output_tokens.input_ids,
-                attention_mask=output_tokens.attention_mask,
-            ).last_hidden_state.float()
         mask = output_tokens.attention_mask.unsqueeze(-1).float()
-        text_embeds = (enc_out * mask).sum(1) / mask.sum(1).clamp(min=1)
+        with torch.no_grad():
+            if self.use_frozen_text_encoder:
+                roberta_out = self.frozen_text_encoder(
+                    input_ids=output_tokens.input_ids,
+                    attention_mask=output_tokens.attention_mask
+                    ).last_hidden_state.float()
+                pooled = (roberta_out * mask).sum(1) / mask.sum(1).clamp(min=1)
+                text_embeds = self.text_align_proj(pooled)  
+            else:
+                enc_out = self.t5_model.encoder(
+                    input_ids=output_tokens.input_ids,
+                    attention_mask=output_tokens.attention_mask,
+                ).last_hidden_state.float()
+                text_embeds = (enc_out * mask).sum(1) / mask.sum(1).clamp(min=1)
 
         # Mean pooling for visual embeddings
         image_embeds = visual_outputs.mean(1)  # [B, d_model]
-
+        
         # Fuse keypoint stream if available
         if self.keypoint_dim > 0 and samples.get('keypoint_values'):
             kp_padded = pad_sequence(samples['keypoint_values'], batch_first=True).to(self.device)  # [B, T, 258]
             kp_emb = self.kp_proj(kp_padded).mean(1)  # [B, d_model]
             image_embeds = image_embeds + kp_emb
 
+        if self.use_frozen_text_encoder:
+            image_embeds = self.image_align_proj(image_embeds)
+        
         # Normalize features
         image_embeds = F.normalize(image_embeds, dim=-1)
         text_embeds = F.normalize(text_embeds, dim=-1)
@@ -913,7 +921,21 @@ class FlanT5SLT(AbstractSLT):
             weight_decay=0.01,
             betas=(0.9, 0.98)
         )
-        
+
+        if self.scheduler_config is not None:
+            from torch.optim.lr_scheduler import LambdaLR
+            from utils.helpers import instantiate_from_config
+            sched = instantiate_from_config(self.scheduler_config)
+            log.info("Using LambdaLR (per-step) scheduler from scheduler_config — paper-style cosine+warmup")
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": LambdaLR(optimizer, lr_lambda=sched.schedule),
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode=self.lr_scheduler_mode,

@@ -5,11 +5,22 @@ import os
 import sys
 from typing import Any
 
+import numpy as np
 import pytorch_lightning as pl
+import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.trainer import Trainer
+
+# PyTorch 2.6+ defaults torch.load to weights_only=True; our ckpts contain numpy
+# scalars in metadata (step counts etc.) which need explicit allowlisting.
+torch.serialization.add_safe_globals([
+    np._core.multiarray.scalar,
+    np.dtype,
+    np.dtypes.Float64DType,
+    np.dtypes.Int64DType,
+])
 
 from utils.helpers import instantiate_from_config
 from spamo.callbacks import SetupCallback

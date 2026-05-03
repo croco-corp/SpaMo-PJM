@@ -17,6 +17,8 @@ class PJMKorpus(torch.utils.data.Dataset):
         key_to_speaker: dict | None = None,
         keypoint_features_path: str | None = None,
         aux_features_path: str | None = None,
+        multilang_path: str | None = None,
+        target_lang: str = 'English',
     ):
         super().__init__()
 
@@ -27,6 +29,8 @@ class PJMKorpus(torch.utils.data.Dataset):
         self.texts_path = texts_path
         self.keypoint_features_path = keypoint_features_path
         self.aux_features_path = aux_features_path
+        self.multilang_path = multilang_path
+        self.target_lang = target_lang
 
         # Load only metadata (keys, texts, speaker ids) — features read lazily in __getitem__
         texts_h5 = h5py.File(texts_path, mode='r')
@@ -47,6 +51,7 @@ class PJMKorpus(torch.utils.data.Dataset):
         self._motion_h5 = None
         self._keypoint_h5 = None
         self._aux_h5 = None
+        self._multilang_h5 = None
 
     def _open_files(self):
         if self._visual_h5 is None:
@@ -54,6 +59,7 @@ class PJMKorpus(torch.utils.data.Dataset):
             self._motion_h5 = h5py.File(self.motion_features_path, mode='r')
             self._keypoint_h5 = h5py.File(self.keypoint_features_path, mode='r') if self.keypoint_features_path else None
             self._aux_h5 = h5py.File(self.aux_features_path, mode='r') if self.aux_features_path else None
+            self._multilang_h5 = h5py.File(self.multilang_path, mode='r') if self.multilang_path else None
 
     def __getitem__(self, index: int) -> dict:
         self._open_files()
@@ -68,7 +74,8 @@ class PJMKorpus(torch.utils.data.Dataset):
         if num_of_frames > self.max_num_of_frames:
             start_index = random.randint(0, num_of_frames - self.max_num_of_frames)
             item_visual_features = item_visual_features[start_index:start_index + self.max_num_of_frames]
-        return {
+
+        out = {
             'id': key,
             'pixel_value': item_visual_features,
             'num_frames': item_visual_features.size(dim=0),
@@ -76,9 +83,20 @@ class PJMKorpus(torch.utils.data.Dataset):
             'keypoint_value': torch.from_numpy(kp) if kp is not None else None,
             'aux_value': torch.from_numpy(aux) if aux is not None else None,
             'text': text,
-            'lang': '',
+            'lang': self.target_lang,
             'speaker_id': speaker_id,
         }
+
+        # Multilang in-context fields (used when t5_slt.use_in_context=True).
+        # Layout: features/texts_multilang_pjm.h5 -> /{key}/{pl,en,fr,es}
+        if self._multilang_h5 is not None and key in self._multilang_h5:
+            grp = self._multilang_h5[key]
+            out['en_text'] = grp['en'][()].decode() if 'en' in grp else text
+            out['fr_text'] = grp['fr'][()].decode() if 'fr' in grp else text
+            out['es_text'] = grp['es'][()].decode() if 'es' in grp else text
+            out['pl_text'] = grp['pl'][()].decode() if 'pl' in grp else text
+
+        return out
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -105,6 +123,8 @@ class PJMDataModule(pl.LightningDataModule):
         set_to_test: str = 'val',
         keypoint_features_path: str | None = None,
         aux_features_path: str | None = None,
+        multilang_path: str | None = None,
+        target_lang: str = 'English',
     ):
         super().__init__()
         self.visual_features_path = visual_features_path
@@ -112,6 +132,8 @@ class PJMDataModule(pl.LightningDataModule):
         self.texts_path = texts_path
         self.device = device
         self.train_split_path = train_split_path
+        self.multilang_path = multilang_path
+        self.target_lang = target_lang
         self.val_split_path = val_split_path
         self.test_split_path = test_split_path
         self.max_frame_length = max_frame_length
@@ -141,6 +163,8 @@ class PJMDataModule(pl.LightningDataModule):
             key_to_speaker=train_k2s,
             keypoint_features_path=self.keypoint_features_path,
             aux_features_path=self.aux_features_path,
+            multilang_path=self.multilang_path,
+            target_lang=self.target_lang,
         )
         self.val_set = PJMKorpus(
             self.visual_features_path,
@@ -152,6 +176,8 @@ class PJMDataModule(pl.LightningDataModule):
             key_to_speaker=val_k2s,
             keypoint_features_path=self.keypoint_features_path,
             aux_features_path=self.aux_features_path,
+            multilang_path=self.multilang_path,
+            target_lang=self.target_lang,
         )
         if self.test_split_path:
             test_keys, test_k2s = self._load_split(self.test_split_path)
@@ -164,6 +190,9 @@ class PJMDataModule(pl.LightningDataModule):
                 keys=test_keys,
                 key_to_speaker=test_k2s,
                 keypoint_features_path=self.keypoint_features_path,
+                aux_features_path=self.aux_features_path,
+                multilang_path=self.multilang_path,
+                target_lang=self.target_lang,
             )
 
     def train_dataloader(self):

@@ -12,12 +12,14 @@ logger = logging.getLogger(__name__)
 def derangement(lst):
     if len(lst) <= 1:
         return lst
-    
-    while True:
-        shuffled = lst[:]
-        random.shuffle(shuffled)
-        if all(original != shuffled[i] for i, original in enumerate(lst)):
-            return shuffled
+
+    n = len(lst)
+    indices = list(range(n))
+    for _ in range(1000):
+        random.shuffle(indices)
+        if all(indices[i] != i for i in range(n)):
+            return [lst[i] for i in indices]
+    return lst[1:] + lst[:1]
 
 
 def normalize(x):
