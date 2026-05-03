@@ -525,14 +525,8 @@ class FlanT5SLT(AbstractSLT):
                 tok_embeds = self.t5_model.encoder.embed_tokens(output_tokens.input_ids).float()
                 text_embeds = (tok_embeds * mask).sum(1) / mask.sum(1).clamp(min=1)
 
-        # Mean pooling for visual embeddings
+        # Mean pooling for visual embeddings; kp already fused into visual_outputs via aux_xattn
         image_embeds = visual_outputs.mean(1)  # [B, d_model]
-        
-        # Fuse keypoint stream if available
-        if self.keypoint_dim > 0 and samples.get('keypoint_values'):
-            kp_padded = pad_sequence(samples['keypoint_values'], batch_first=True).to(self.device)  # [B, T, 258]
-            kp_emb = self.kp_proj(kp_padded).mean(1)  # [B, d_model]
-            image_embeds = image_embeds + kp_emb
 
         if self.use_frozen_text_encoder:
             image_embeds = self.image_align_proj(image_embeds)
