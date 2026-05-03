@@ -96,3 +96,4 @@ nohup.out.*
 .python-version
 test.py
 features/*.h5*
+nohup_*.out

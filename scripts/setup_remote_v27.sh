@@ -32,7 +32,7 @@ export PATH="$HOME/.local/bin:$PATH"
 uv venv .venv --python 3.10
 source .venv/bin/activate
 uv pip install "setuptools<70"
-uv pip install -r requirements.txt
+uv pip install -e .
 
 echo "=== [2/5] W&B login ==="
 wandb login --relogin "$WANDB_API_KEY"
