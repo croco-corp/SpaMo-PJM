@@ -1,7 +1,42 @@
 import os
 
 from omegaconf import OmegaConf
-from pytorch_lightning.callbacks import Callback                                 
+from pytorch_lightning.callbacks import Callback
+
+
+def dump_test_outputs(save_dir, references, generated, logger=None, split: str = "test"):
+    """Dump full reference/generated pairs to <save_dir>/<split>_outputs.txt and
+    log a W&B table when a wandb logger is provided.
+
+    Used by `on_test_epoch_end` (and optionally `on_validation_epoch_end`) — the
+    paper's `LoggingCallback.log_generated_text` was deadcode (never wired into the
+    Lightning module); this is the working replacement. File dump captures all pairs
+    (1468 for PJM-MS test); W&B table is the same data for dashboard inspection.
+    """
+    pairs = list(zip(references, generated))
+
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"{split}_outputs.txt")
+        with open(path, "w") as f:
+            f.write(f"# {len(pairs)} pairs ({split})\n\n")
+            for i, (ref, gen) in enumerate(pairs):
+                f.write(f"[{i}]\nReference: {ref}\nGenerated: {gen}\n\n")
+        print(f"Dumped {len(pairs)} pairs → {path}")
+    except Exception as e:
+        print(f"Could not dump {split}_outputs.txt: {e}")
+
+    try:
+        if logger is not None and hasattr(logger, "experiment"):
+            import wandb
+            table = wandb.Table(
+                columns=["idx", "reference", "generated"],
+                data=[[i, ref, gen] for i, (ref, gen) in enumerate(pairs)],
+            )
+            logger.experiment.log({f"{split}/translations": table})
+            print(f"Logged {len(pairs)} translations to W&B {split}/translations")
+    except Exception as e:
+        print(f"Could not log W&B {split} table: {e}")
 
 
 class LoggingCallback(Callback):
