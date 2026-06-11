@@ -6,6 +6,7 @@ dependencies = [
     "accelerate==1.4.0",
     "av>=16.0.1",
     "bert-score>=0.3.13",
+    "bleurt-pytorch==0.0.1",
     "datasets>=4.4.1",
     "einops==0.8.1",
     "einops-exts==0.0.4",
